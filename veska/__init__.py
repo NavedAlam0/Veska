@@ -7,6 +7,10 @@ Supports Claude API and OpenAI API with per-agent configuration.
 
 __version__ = "0.1.0"
 
+# Auto-load .env file on import (searches cwd and parent dirs)
+from veska.core.env import load_env as _load_env
+_load_env()
+
 # Core
 from veska.core.agent import Agent, AgentConfig, AgentResult
 from veska.core.orchestrator import Orchestrator, OrchestratorConfig, OrchestratorResult

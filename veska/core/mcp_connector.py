@@ -14,6 +14,7 @@ import json
 import subprocess
 from typing import Any, Optional
 
+from veska.core.env import resolve_env_vars
 from veska.tools.base import Tool, ToolParameter, ToolResult
 
 
@@ -23,6 +24,12 @@ class MCPServer:
 
     Each server provides tools that get registered into the
     agent's tool list alongside pre-built and custom tools.
+
+    env accepts either:
+      - list of env variable names: ["GITHUB_TOKEN"]
+        → auto-fetches values from .env
+      - dict of key-value pairs: {"GITHUB_TOKEN": "ghp-abc123"}
+        → uses values directly
     """
 
     def __init__(
@@ -30,12 +37,17 @@ class MCPServer:
         name: str,
         command: str,
         args: Optional[list[str]] = None,
-        env: Optional[dict[str, str]] = None,
+        env: Optional[list[str] | dict[str, str]] = None,
     ) -> None:
         self.name = name
         self.command = command
         self.args = args or []
-        self.env = env or {}
+
+        # Resolve env: list of names → auto-fetch from .env
+        if isinstance(env, list):
+            self.env = resolve_env_vars(env)
+        else:
+            self.env = env or {}
         self._process: Optional[asyncio.subprocess.Process] = None
         self._tools: list[Tool] = []
         self._connected = False

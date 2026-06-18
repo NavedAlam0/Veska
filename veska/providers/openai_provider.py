@@ -7,11 +7,11 @@ Handles all communication with OpenAI's GPT models.
 from __future__ import annotations
 
 import json
-import os
 from typing import Any, Optional
 
 import openai
 
+from veska.core.env import get_env
 from veska.providers.base import (
     BaseProvider,
     Message,
@@ -23,15 +23,20 @@ from veska.providers.base import (
 class OpenAIProvider(BaseProvider):
     """Provider for OpenAI's GPT API."""
 
+    DEFAULT_MODEL = "gpt-4o"
+
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "gpt-4o",
+        model: Optional[str] = None,
         max_tokens: int = 8096,
         **kwargs: Any,
     ) -> None:
-        key = api_key or os.environ.get("OPENAI_API_KEY", "")
-        super().__init__(api_key=key, model=model, **kwargs)
+        # Priority: passed directly > .env > error
+        key = api_key or get_env("OPENAI_API_KEY", "")
+        resolved_model = model or get_env("OPENAI_MODEL") or self.DEFAULT_MODEL
+
+        super().__init__(api_key=key, model=resolved_model, **kwargs)
         self.max_tokens = max_tokens
         self.client = openai.AsyncOpenAI(api_key=key)
 

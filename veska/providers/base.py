@@ -54,7 +54,7 @@ class BaseProvider(ABC):
     Agent code works identically regardless of provider.
     """
 
-    def __init__(self, api_key: str, model: str, **kwargs: Any) -> None:
+    def __init__(self, api_key: str = "", model: str = "", **kwargs: Any) -> None:
         self.api_key = api_key
         self.model = model
         self.kwargs = kwargs

@@ -7,11 +7,11 @@ Supports extended thinking for models that support it.
 
 from __future__ import annotations
 
-import os
 from typing import Any, Optional
 
 import anthropic
 
+from veska.core.env import get_env
 from veska.providers.base import (
     BaseProvider,
     Message,
@@ -32,15 +32,20 @@ THINKING_MODELS = {
 class ClaudeProvider(BaseProvider):
     """Provider for Anthropic's Claude API."""
 
+    DEFAULT_MODEL = "claude-sonnet-4-6"
+
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "claude-sonnet-4-6",
+        model: Optional[str] = None,
         max_tokens: int = 8096,
         **kwargs: Any,
     ) -> None:
-        key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
-        super().__init__(api_key=key, model=model, **kwargs)
+        # Priority: passed directly > .env > error
+        key = api_key or get_env("ANTHROPIC_API_KEY", "")
+        resolved_model = model or get_env("ANTHROPIC_MODEL") or self.DEFAULT_MODEL
+
+        super().__init__(api_key=key, model=resolved_model, **kwargs)
         self.max_tokens = max_tokens
         self.client = anthropic.AsyncAnthropic(api_key=key)
 
