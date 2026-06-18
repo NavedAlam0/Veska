@@ -31,6 +31,7 @@ from veska.core.task_planner import TaskPlanner, Task, TaskStatus
 from veska.core.thinking import ThinkingHandler
 from veska.providers.base import BaseProvider, Message
 from veska.tools.base import Tool
+from veska.tools.delegation import create_delegation_tool
 from veska.tools.registry import ToolRegistry
 
 
@@ -45,6 +46,9 @@ class OrchestratorConfig:
         thinking: Optional[dict] = None,
         interaction_level: str = "balanced",  # minimal, balanced, detailed
         storage_dir: Optional[str] = None,
+        # Delegation (off by default)
+        allow_delegation: bool = False,
+        delegation_timeout: int = 300,
         # Optional systems (off by default)
         tracking: Optional[dict] = None,
         recovery: Optional[dict] = None,
@@ -58,6 +62,8 @@ class OrchestratorConfig:
         self.thinking = thinking or {}
         self.interaction_level = interaction_level
         self.storage_dir = storage_dir
+        self.allow_delegation = allow_delegation
+        self.delegation_timeout = delegation_timeout
         self.tracking = tracking
         self.recovery = recovery
         self.security = security
@@ -110,6 +116,10 @@ class Orchestrator:
         # Agents
         self._agents: dict[str, Agent] = dict(config.agents)
 
+        # Delegation
+        if config.allow_delegation and self._agents:
+            self._setup_delegation(config.delegation_timeout)
+
         # Thinking support for orchestrator's own planning
         self._thinking = ThinkingHandler(**(config.thinking or {}))
 
@@ -127,6 +137,58 @@ class Orchestrator:
         self.events.on(EventType.RESUMED, self._on_resume)
         self.events.on(EventType.CANCELLED, self._on_cancel)
         self.events.on(EventType.USER_FEEDBACK, self._on_feedback)
+
+    # --- Delegation ---
+
+    def _setup_delegation(self, timeout: int = 300) -> None:
+        """Register delegate_task tool on all agents."""
+        # Build agent directory: {name: system_prompt_summary}
+        agent_directory = {}
+        for name, agent in self._agents.items():
+            # Use first 100 chars of system prompt as description
+            desc = agent.prompt_manager.developer_prompt[:100] if agent.prompt_manager.developer_prompt else name
+            agent_directory[name] = desc
+
+        # Give each agent a delegation tool
+        for name, agent in self._agents.items():
+            delegation_tool = create_delegation_tool(
+                agent_directory=agent_directory,
+                run_delegate=self._run_delegate,
+                self_name=name,
+                current_depth=0,
+                timeout=timeout,
+            )
+            agent.update_tools(agent.tools + [delegation_tool])
+
+    async def _run_delegate(self, agent_name: str, task: str, depth: int) -> str:
+        """Execute a delegated task on the target agent."""
+        agent = self._agents.get(agent_name)
+        if not agent:
+            return f"Error: Agent '{agent_name}' not found."
+
+        # If delegation is chained, update the delegation tool depth on the target
+        # so it knows its current depth for guard rails
+        if depth > 0:
+            for i, tool in enumerate(agent.tools):
+                if tool.name == "delegate_task":
+                    # Rebuild with incremented depth
+                    agent_directory = {}
+                    for n, a in self._agents.items():
+                        desc = a.prompt_manager.developer_prompt[:100] if a.prompt_manager.developer_prompt else n
+                        agent_directory[n] = desc
+
+                    agent.tools[i] = create_delegation_tool(
+                        agent_directory=agent_directory,
+                        run_delegate=self._run_delegate,
+                        self_name=agent_name,
+                        current_depth=depth,
+                        timeout=self.config.delegation_timeout,
+                    )
+                    agent._tool_map[agent.tools[i].name] = agent.tools[i]
+                    break
+
+        result = await agent.run(task=task)
+        return result.output if result.success else f"Error: {result.error}"
 
     # --- Agent management ---
 

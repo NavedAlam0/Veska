@@ -2,12 +2,13 @@
 Claude API provider.
 
 Handles all communication with Anthropic's Claude models.
-Supports extended thinking for models that support it.
+Supports extended thinking and streaming.
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import json
+from typing import Any, AsyncGenerator, Optional, Union
 
 import anthropic
 
@@ -16,6 +17,7 @@ from veska.providers.base import (
     BaseProvider,
     Message,
     ProviderResponse,
+    StreamEvent,
     ThinkingConfig,
 )
 
@@ -41,7 +43,6 @@ class ClaudeProvider(BaseProvider):
         max_tokens: int = 8096,
         **kwargs: Any,
     ) -> None:
-        # Priority: passed directly > .env > error
         key = api_key or get_env("ANTHROPIC_API_KEY", "")
         resolved_model = model or get_env("ANTHROPIC_MODEL") or self.DEFAULT_MODEL
 
@@ -61,13 +62,28 @@ class ClaudeProvider(BaseProvider):
         messages: list[Message],
         tools: Optional[list[dict]] = None,
         thinking: Optional[ThinkingConfig] = None,
+        stream: bool = False,
         **kwargs: Any,
-    ) -> ProviderResponse:
-        """Send messages to Claude and get a standardized response."""
+    ) -> Union[ProviderResponse, AsyncGenerator[StreamEvent, None]]:
+        """Send messages to Claude. Returns full response or streams events."""
+        api_kwargs = self._build_api_kwargs(messages, tools, thinking)
 
-        # Separate system message from conversation
+        if stream:
+            return self._stream(api_kwargs, thinking)
+
+        response = await self.client.messages.create(**api_kwargs)
+        return self._parse_response(response, thinking)
+
+    def _build_api_kwargs(
+        self,
+        messages: list[Message],
+        tools: Optional[list[dict]],
+        thinking: Optional[ThinkingConfig],
+    ) -> dict[str, Any]:
+        """Convert messages and build API kwargs. Used by both bulk and stream."""
         system_prompt = ""
         conversation = []
+
         for msg in messages:
             if msg.role == "system":
                 system_prompt = msg.content
@@ -83,7 +99,7 @@ class ClaudeProvider(BaseProvider):
                     ],
                 })
             elif msg.role == "assistant" and msg.tool_calls:
-                content = []
+                content: list[dict[str, Any]] = []
                 if msg.content:
                     content.append({"type": "text", "text": msg.content})
                 for tc in msg.tool_calls:
@@ -95,12 +111,18 @@ class ClaudeProvider(BaseProvider):
                     })
                 conversation.append({"role": "assistant", "content": content})
             else:
-                conversation.append({
-                    "role": msg.role,
-                    "content": msg.content,
-                })
+                if isinstance(msg.content, list):
+                    # Multi-modal content blocks
+                    conversation.append({
+                        "role": msg.role,
+                        "content": _to_claude_content_blocks(msg.content),
+                    })
+                else:
+                    conversation.append({
+                        "role": msg.role,
+                        "content": msg.content,
+                    })
 
-        # Build API call kwargs
         api_kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self.max_tokens,
@@ -113,31 +135,91 @@ class ClaudeProvider(BaseProvider):
         if tools:
             api_kwargs["tools"] = tools
 
-        # Handle thinking
-        use_thinking = (
-            thinking
-            and thinking.enabled
-            and self.supports_thinking()
-        )
-
-        if use_thinking:
+        if thinking and thinking.enabled and self.supports_thinking():
             api_kwargs["thinking"] = {
                 "type": "enabled",
                 "budget_tokens": thinking.budget_tokens,
             }
 
-        # Make the API call
-        response = await self.client.messages.create(**api_kwargs)
+        return api_kwargs
 
-        # Parse response
-        return self._parse_response(response, thinking)
+    async def _stream(
+        self,
+        api_kwargs: dict[str, Any],
+        thinking: Optional[ThinkingConfig],
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """Stream response from Claude, yielding events as tokens arrive."""
+        content_text = ""
+        thinking_text = ""
+        tool_calls = []
+        current_tool: dict[str, Any] = {}
+        current_tool_input = ""
+        input_tokens = 0
+        output_tokens = 0
+
+        async with self.client.messages.stream(**api_kwargs) as stream:
+            async for event in stream:
+                if event.type == "content_block_start":
+                    block = event.content_block
+                    if block.type == "tool_use":
+                        current_tool = {"id": block.id, "name": block.name}
+                        current_tool_input = ""
+                        yield StreamEvent(
+                            type="tool_call",
+                            tool_name=block.name,
+                            tool_call_id=block.id,
+                        )
+
+                elif event.type == "content_block_delta":
+                    delta = event.delta
+                    if delta.type == "text_delta":
+                        content_text += delta.text
+                        yield StreamEvent(type="text_delta", text=delta.text)
+                    elif delta.type == "thinking_delta":
+                        thinking_text += delta.thinking
+                        if thinking and thinking.output != "discard":
+                            yield StreamEvent(type="thinking_delta", thinking=delta.thinking)
+                    elif delta.type == "input_json_delta":
+                        current_tool_input += delta.partial_json
+
+                elif event.type == "content_block_stop":
+                    if current_tool:
+                        try:
+                            arguments = json.loads(current_tool_input) if current_tool_input else {}
+                        except json.JSONDecodeError:
+                            arguments = {}
+                        current_tool["arguments"] = arguments
+                        tool_calls.append(current_tool)
+                        current_tool = {}
+                        current_tool_input = ""
+
+                elif event.type == "message_delta":
+                    if hasattr(event, "usage") and event.usage:
+                        output_tokens = event.usage.output_tokens
+
+                elif event.type == "message_start":
+                    if hasattr(event, "message") and hasattr(event.message, "usage"):
+                        input_tokens = event.message.usage.input_tokens
+
+        yield StreamEvent(
+            type="done",
+            response=ProviderResponse(
+                content=content_text,
+                thinking=thinking_text if thinking_text and thinking and thinking.output != "discard" else None,
+                tool_calls=tool_calls,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                model=self.model,
+                stop_reason="end_turn" if not tool_calls else "tool_use",
+            ),
+        )
 
     def _parse_response(
         self,
         response: Any,
         thinking: Optional[ThinkingConfig],
     ) -> ProviderResponse:
-        """Parse Claude's response into standardized format."""
+        """Parse Claude's bulk response into standardized format."""
         content = ""
         thinking_text = None
         tool_calls = []
@@ -164,3 +246,44 @@ class ClaudeProvider(BaseProvider):
             model=response.model,
             stop_reason=response.stop_reason,
         )
+
+
+def _to_claude_content_blocks(blocks: list[dict]) -> list[dict]:
+    """Convert processor content blocks to Claude API format."""
+    claude_blocks = []
+
+    for block in blocks:
+        if block["type"] == "text":
+            claude_blocks.append({"type": "text", "text": block["text"]})
+
+        elif block["type"] == "image":
+            if block.get("source_type") == "base64":
+                claude_blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": block["media_type"],
+                        "data": block["data"],
+                    },
+                })
+            elif block.get("source_type") == "url":
+                claude_blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "url",
+                        "url": block["url"],
+                    },
+                })
+
+        elif block["type"] == "document":
+            if block.get("source_type") == "base64":
+                claude_blocks.append({
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": block["media_type"],
+                        "data": block["data"],
+                    },
+                })
+
+    return claude_blocks

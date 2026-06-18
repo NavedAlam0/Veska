@@ -2,12 +2,13 @@
 OpenAI API provider.
 
 Handles all communication with OpenAI's GPT models.
+Supports streaming.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any, AsyncGenerator, Optional, Union
 
 import openai
 
@@ -16,6 +17,7 @@ from veska.providers.base import (
     BaseProvider,
     Message,
     ProviderResponse,
+    StreamEvent,
     ThinkingConfig,
 )
 
@@ -32,7 +34,6 @@ class OpenAIProvider(BaseProvider):
         max_tokens: int = 8096,
         **kwargs: Any,
     ) -> None:
-        # Priority: passed directly > .env > error
         key = api_key or get_env("OPENAI_API_KEY", "")
         resolved_model = model or get_env("OPENAI_MODEL") or self.DEFAULT_MODEL
 
@@ -45,7 +46,6 @@ class OpenAIProvider(BaseProvider):
         return "openai"
 
     def supports_thinking(self) -> bool:
-        # OpenAI doesn't support extended thinking in the same way
         return False
 
     async def chat(
@@ -53,12 +53,27 @@ class OpenAIProvider(BaseProvider):
         messages: list[Message],
         tools: Optional[list[dict]] = None,
         thinking: Optional[ThinkingConfig] = None,
+        stream: bool = False,
         **kwargs: Any,
-    ) -> ProviderResponse:
-        """Send messages to OpenAI and get a standardized response."""
+    ) -> Union[ProviderResponse, AsyncGenerator[StreamEvent, None]]:
+        """Send messages to OpenAI. Returns full response or streams events."""
+        api_kwargs = self._build_api_kwargs(messages, tools, stream)
 
-        # Convert messages to OpenAI format
+        if stream:
+            return self._stream(api_kwargs)
+
+        response = await self.client.chat.completions.create(**api_kwargs)
+        return self._parse_response(response)
+
+    def _build_api_kwargs(
+        self,
+        messages: list[Message],
+        tools: Optional[list[dict]],
+        stream: bool = False,
+    ) -> dict[str, Any]:
+        """Convert messages and build API kwargs. Used by both bulk and stream."""
         openai_messages = []
+
         for msg in messages:
             if msg.role == "tool":
                 openai_messages.append({
@@ -84,12 +99,18 @@ class OpenAIProvider(BaseProvider):
                 }
                 openai_messages.append(assistant_msg)
             else:
-                openai_messages.append({
-                    "role": msg.role,
-                    "content": msg.content,
-                })
+                if isinstance(msg.content, list):
+                    # Multi-modal content blocks
+                    openai_messages.append({
+                        "role": msg.role,
+                        "content": _to_openai_content_blocks(msg.content),
+                    })
+                else:
+                    openai_messages.append({
+                        "role": msg.role,
+                        "content": msg.content,
+                    })
 
-        # Build API call kwargs
         api_kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self.max_tokens,
@@ -99,14 +120,94 @@ class OpenAIProvider(BaseProvider):
         if tools:
             api_kwargs["tools"] = tools
 
-        # Make the API call
-        response = await self.client.chat.completions.create(**api_kwargs)
+        if stream:
+            api_kwargs["stream"] = True
+            api_kwargs["stream_options"] = {"include_usage": True}
 
-        # Parse response
-        return self._parse_response(response)
+        return api_kwargs
+
+    async def _stream(
+        self,
+        api_kwargs: dict[str, Any],
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """Stream response from OpenAI, yielding events as tokens arrive."""
+        content_text = ""
+        tool_calls_data: dict[int, dict[str, Any]] = {}
+        input_tokens = 0
+        output_tokens = 0
+        finish_reason = None
+
+        stream = await self.client.chat.completions.create(**api_kwargs)
+
+        async for chunk in stream:
+            if not chunk.choices and chunk.usage:
+                input_tokens = chunk.usage.prompt_tokens
+                output_tokens = chunk.usage.completion_tokens
+                continue
+
+            if not chunk.choices:
+                continue
+
+            choice = chunk.choices[0]
+            delta = choice.delta
+
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+
+            if delta and delta.content:
+                content_text += delta.content
+                yield StreamEvent(type="text_delta", text=delta.content)
+
+            if delta and delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tool_calls_data:
+                        tool_calls_data[idx] = {
+                            "id": tc_delta.id or "",
+                            "name": "",
+                            "arguments": "",
+                        }
+                    if tc_delta.id:
+                        tool_calls_data[idx]["id"] = tc_delta.id
+                    if tc_delta.function:
+                        if tc_delta.function.name:
+                            tool_calls_data[idx]["name"] = tc_delta.function.name
+                            yield StreamEvent(
+                                type="tool_call",
+                                tool_name=tc_delta.function.name,
+                                tool_call_id=tc_delta.id or tool_calls_data[idx]["id"],
+                            )
+                        if tc_delta.function.arguments:
+                            tool_calls_data[idx]["arguments"] += tc_delta.function.arguments
+
+        tool_calls = []
+        for idx in sorted(tool_calls_data.keys()):
+            tc = tool_calls_data[idx]
+            try:
+                arguments = json.loads(tc["arguments"]) if tc["arguments"] else {}
+            except json.JSONDecodeError:
+                arguments = {}
+            tool_calls.append({
+                "id": tc["id"],
+                "name": tc["name"],
+                "arguments": arguments,
+            })
+
+        yield StreamEvent(
+            type="done",
+            response=ProviderResponse(
+                content=content_text,
+                thinking=None,
+                tool_calls=tool_calls,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                model=self.model,
+                stop_reason=finish_reason,
+            ),
+        )
 
     def _parse_response(self, response: Any) -> ProviderResponse:
-        """Parse OpenAI's response into standardized format."""
+        """Parse OpenAI's bulk response into standardized format."""
         choice = response.choices[0]
         message = choice.message
 
@@ -123,10 +224,48 @@ class OpenAIProvider(BaseProvider):
 
         return ProviderResponse(
             content=content,
-            thinking=None,  # OpenAI doesn't support thinking
+            thinking=None,
             tool_calls=tool_calls,
             input_tokens=response.usage.prompt_tokens if response.usage else 0,
             output_tokens=response.usage.completion_tokens if response.usage else 0,
             model=response.model,
             stop_reason=choice.finish_reason,
         )
+
+
+def _to_openai_content_blocks(blocks: list[dict]) -> list[dict]:
+    """Convert processor content blocks to OpenAI API format."""
+    openai_blocks = []
+
+    for block in blocks:
+        if block["type"] == "text":
+            openai_blocks.append({"type": "text", "text": block["text"]})
+
+        elif block["type"] == "image":
+            if block.get("source_type") == "base64":
+                data_url = f"data:{block['media_type']};base64,{block['data']}"
+                entry: dict = {
+                    "type": "image_url",
+                    "image_url": {"url": data_url},
+                }
+                if block.get("detail") and block["detail"] != "auto":
+                    entry["image_url"]["detail"] = block["detail"]
+                openai_blocks.append(entry)
+
+            elif block.get("source_type") == "url":
+                entry = {
+                    "type": "image_url",
+                    "image_url": {"url": block["url"]},
+                }
+                if block.get("detail") and block["detail"] != "auto":
+                    entry["image_url"]["detail"] = block["detail"]
+                openai_blocks.append(entry)
+
+        elif block["type"] == "document":
+            # OpenAI doesn't support document blocks natively — include as text note
+            openai_blocks.append({
+                "type": "text",
+                "text": "[PDF document attached — text extraction required for OpenAI]",
+            })
+
+    return openai_blocks

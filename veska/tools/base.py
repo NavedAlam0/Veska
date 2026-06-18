@@ -140,7 +140,12 @@ class Tool(BaseModel):
                 },
             }
         else:
-            raise ValueError(f"Unknown provider: {provider}")
+            # Default: use Claude format as fallback
+            return {
+                "name": schema["name"],
+                "description": self._build_description(),
+                "input_schema": schema["parameters"],
+            }
 
     def _build_description(self) -> str:
         """Build full description including when_to_use."""
