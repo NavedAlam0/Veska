@@ -122,7 +122,3 @@ writer = Agent(name="writer", model="gpt-4o")
 
 - Python 3.10+
 - `anthropic`, `openai`, `pydantic`
-
-## License
-
-MIT
