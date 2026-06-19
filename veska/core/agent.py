@@ -182,7 +182,7 @@ class Agent:
         self._status = value
         self.memory.set_state(value)
 
-    def run(
+    async def arun(
         self,
         task: str,
         context: str = "",
@@ -193,7 +193,7 @@ class Agent:
         session_id: Optional[str] = None,
     ) -> Any:
         """
-        Run a task. Handles everything internally.
+        Async entry point. Use this inside FastAPI, Jupyter, or any async app.
 
         Args:
             task: The task description.
@@ -206,24 +206,47 @@ class Agent:
             user_id: Optional user identifier for session persistence.
             session_id: Optional session identifier for conversation resumption.
         """
-        import asyncio
-
-        # Use agent-level output_format if no explicit output_model passed
         effective_model = output_model or self._output_model
 
         if stream:
-            # Determine the callback
             if stream is True:
                 callback = lambda text: print(text, end="", flush=True)
             else:
                 callback = stream
 
-            return asyncio.run(
-                self._run_with_stream(callback, task, context, effective_model, attachments, user_id, session_id)
+            return await self._run_with_stream(callback, task, context, effective_model, attachments, user_id, session_id)
+
+        return await self._run_bulk(task, context, effective_model, attachments, user_id, session_id)
+
+    def run(
+        self,
+        task: str,
+        context: str = "",
+        stream: Union[bool, callable, None] = None,
+        output_model: Optional[Type[BaseModel]] = None,
+        attachments: Optional[list] = None,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Any:
+        """
+        Sync entry point for scripts. Do NOT call inside a running event loop.
+        Use await agent.arun(...) instead for async apps.
+        """
+        import asyncio
+
+        try:
+            asyncio.get_running_loop()
+            raise RuntimeError(
+                "agent.run() was called inside a running event loop. "
+                "Use: result = await agent.arun(...) instead."
             )
+        except RuntimeError as e:
+            if "running event loop" in str(e):
+                raise
+            pass
 
         return asyncio.run(
-            self._run_bulk(task, context, effective_model, attachments, user_id, session_id)
+            self.arun(task, context, stream, output_model, attachments, user_id, session_id)
         )
 
     async def _run_with_stream(

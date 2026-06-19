@@ -286,9 +286,9 @@ Your job:
 
     # --- Agent management ---
 
-    def register_agent(self, name: str, agent: Agent) -> None:
+    def register_agent(self, agent: Agent) -> None:
         """Register an agent with the orchestrator."""
-        self._agents[name] = agent
+        self._agents[agent.name] = agent
 
         # Subscribe agent to message bus
         async def agent_message_handler(msg: BusMessage) -> None:
@@ -299,7 +299,7 @@ Your job:
                 category="messages",
             )
 
-        self.message_bus.subscribe(name, agent_message_handler)
+        self.message_bus.subscribe(agent.name, agent_message_handler)
 
         # Store agent's memory in shared memory
         self.shared_memory.store(agent.memory)
@@ -310,16 +310,34 @@ Your job:
 
     # --- Main execution ---
 
-    def run(self, prompt: str) -> OrchestratorResult:
+    async def arun(self, prompt: str) -> OrchestratorResult:
         """
-        Run the orchestrator. Handles everything internally.
+        Async entry point. Use this inside FastAPI, Jupyter, or any async app.
 
         Args:
             prompt: What you want the agents to do.
         """
+        return await self._run_async(prompt)
+
+    def run(self, prompt: str) -> OrchestratorResult:
+        """
+        Sync entry point for scripts. Do NOT call inside a running event loop.
+        Use: result = await orchestrator.arun(...) instead.
+        """
         import asyncio
 
-        return asyncio.run(self._run_async(prompt))
+        try:
+            asyncio.get_running_loop()
+            raise RuntimeError(
+                "orchestrator.run() was called inside a running event loop. "
+                "Use: result = await orchestrator.arun(...) instead."
+            )
+        except RuntimeError as e:
+            if "running event loop" in str(e):
+                raise
+            pass
+
+        return asyncio.run(self.arun(prompt))
 
     async def _run_async(self, prompt: str) -> OrchestratorResult:
         """Internal async implementation."""

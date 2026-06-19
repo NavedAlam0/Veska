@@ -1,5 +1,7 @@
 # Veska
 
+![CI](https://github.com/NavedAlam0/Veska/actions/workflows/ci.yml/badge.svg)
+
 A multi-agent AI framework built from scratch in Python. No LangChain, no CrewAI, no AutoGen — 100% custom-built for full control.
 
 ## Install

@@ -3,6 +3,9 @@ Pre-built Code Runner tools for Veska.
 
 Provides: run_python, run_node, run_command, install_package, run_tests
 User just adds "code_runner" to their tools list.
+
+When a CommandGuard is provided, all commands are checked against the
+sandbox before execution. Without a guard, commands run directly.
 """
 
 from __future__ import annotations
@@ -16,67 +19,28 @@ from typing import Optional
 from veska.tools.base import Tool, ToolParameter
 
 
-def _run_python(code: str, cwd: str = ".") -> str:
-    """Run Python code and return output."""
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, dir=cwd
-    ) as f:
-        f.write(code)
-        f.flush()
-        try:
-            result = subprocess.run(
-                ["python3", f.name],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                cwd=cwd,
-            )
-            output = result.stdout
-            if result.stderr:
-                output += f"\nSTDERR:\n{result.stderr}"
-            return output or "(no output)"
-        except subprocess.TimeoutExpired:
-            return "Error: Code execution timed out (30s limit)"
-        finally:
-            Path(f.name).unlink(missing_ok=True)
+async def _guarded_run(guard, agent_name: str, command: str, cwd: str = ".", timeout: int = 60) -> str:
+    """Run a command through the CommandGuard."""
+    result = await guard.run(agent_name=agent_name, command=command, cwd=cwd, timeout=timeout)
+    if result.blocked:
+        return f"Blocked: {result.block_reason}"
+    output = result.stdout
+    if result.stderr:
+        output += f"\nSTDERR:\n{result.stderr}"
+    if result.return_code != 0:
+        output += f"\nExit code: {result.return_code}"
+    return output or "(no output)"
 
 
-def _run_node(code: str, cwd: str = ".") -> str:
-    """Run Node.js code and return output."""
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".js", delete=False, dir=cwd
-    ) as f:
-        f.write(code)
-        f.flush()
-        try:
-            result = subprocess.run(
-                ["node", f.name],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                cwd=cwd,
-            )
-            output = result.stdout
-            if result.stderr:
-                output += f"\nSTDERR:\n{result.stderr}"
-            return output or "(no output)"
-        except subprocess.TimeoutExpired:
-            return "Error: Code execution timed out (30s limit)"
-        except FileNotFoundError:
-            return "Error: Node.js not found. Install Node.js first."
-        finally:
-            Path(f.name).unlink(missing_ok=True)
-
-
-def _run_command(command: str, cwd: str = ".") -> str:
-    """Run a shell command and return output."""
+def _raw_run(command: str, cwd: str = ".", timeout: int = 60, shell: bool = True) -> str:
+    """Run a command directly via subprocess (no guard)."""
     try:
         result = subprocess.run(
-            command,
-            shell=True,
+            command if shell else command.split(),
+            shell=shell,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=timeout,
             cwd=cwd,
         )
         output = result.stdout
@@ -86,64 +50,108 @@ def _run_command(command: str, cwd: str = ".") -> str:
             output += f"\nExit code: {result.returncode}"
         return output or "(no output)"
     except subprocess.TimeoutExpired:
-        return "Error: Command timed out (60s limit)"
+        return f"Error: Command timed out ({timeout}s limit)"
 
 
-def _install_package(package: str, manager: str = "pip", cwd: str = ".") -> str:
-    """Install a package using pip or npm."""
-    if manager == "pip":
-        cmd = f"pip install {package}"
-    elif manager == "npm":
-        cmd = f"npm install {package}"
-    else:
-        return f"Error: Unknown package manager '{manager}'. Use 'pip' or 'npm'."
+def _make_run_python(guard=None, agent_name: str = "agent"):
+    """Create a run_python function, optionally guarded."""
 
-    try:
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            cwd=cwd,
-        )
-        if result.returncode == 0:
-            return f"Successfully installed {package}"
-        return f"Failed to install {package}:\n{result.stderr}"
-    except subprocess.TimeoutExpired:
-        return f"Error: Installation of {package} timed out"
+    async def run_python(code: str, cwd: str = ".") -> str:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False, dir=cwd
+        ) as f:
+            f.write(code)
+            f.flush()
+            try:
+                cmd = f"python3 {f.name}"
+                if guard:
+                    return await _guarded_run(guard, agent_name, cmd, cwd, timeout=30)
+                return _raw_run(cmd, cwd, timeout=30)
+            finally:
+                Path(f.name).unlink(missing_ok=True)
+
+    return run_python
 
 
-def _run_tests(directory: str, framework: str = "pytest") -> str:
-    """Run tests in a directory."""
-    if framework == "pytest":
-        cmd = f"python3 -m pytest {directory} -v --tb=short"
-    elif framework == "jest":
-        cmd = f"npx jest {directory} --verbose"
-    elif framework == "unittest":
-        cmd = f"python3 -m unittest discover {directory} -v"
-    else:
-        return f"Error: Unknown test framework '{framework}'"
+def _make_run_node(guard=None, agent_name: str = "agent"):
+    """Create a run_node function, optionally guarded."""
 
-    try:
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            cwd=directory,
-        )
-        output = result.stdout
-        if result.stderr:
-            output += f"\n{result.stderr}"
-        return output or "(no output)"
-    except subprocess.TimeoutExpired:
-        return "Error: Tests timed out (120s limit)"
+    async def run_node(code: str, cwd: str = ".") -> str:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".js", delete=False, dir=cwd
+        ) as f:
+            f.write(code)
+            f.flush()
+            try:
+                cmd = f"node {f.name}"
+                if guard:
+                    return await _guarded_run(guard, agent_name, cmd, cwd, timeout=30)
+                return _raw_run(cmd, cwd, timeout=30)
+            except FileNotFoundError:
+                return "Error: Node.js not found. Install Node.js first."
+            finally:
+                Path(f.name).unlink(missing_ok=True)
+
+    return run_node
 
 
-def get_code_runner_tools() -> list[Tool]:
-    """Get all code runner tools."""
+def _make_run_command(guard=None, agent_name: str = "agent"):
+    """Create a run_command function, optionally guarded."""
+
+    async def run_command(command: str, cwd: str = ".") -> str:
+        if guard:
+            return await _guarded_run(guard, agent_name, command, cwd, timeout=60)
+        return _raw_run(command, cwd, timeout=60)
+
+    return run_command
+
+
+def _make_install_package(guard=None, agent_name: str = "agent"):
+    """Create an install_package function, optionally guarded."""
+
+    async def install_package(package: str, manager: str = "pip", cwd: str = ".") -> str:
+        if manager == "pip":
+            cmd = f"pip install {package}"
+        elif manager == "npm":
+            cmd = f"npm install {package}"
+        else:
+            return f"Error: Unknown package manager '{manager}'. Use 'pip' or 'npm'."
+
+        if guard:
+            return await _guarded_run(guard, agent_name, cmd, cwd, timeout=120)
+        return _raw_run(cmd, cwd, timeout=120)
+
+    return install_package
+
+
+def _make_run_tests(guard=None, agent_name: str = "agent"):
+    """Create a run_tests function, optionally guarded."""
+
+    async def run_tests(directory: str, framework: str = "pytest") -> str:
+        if framework == "pytest":
+            cmd = f"python3 -m pytest {directory} -v --tb=short"
+        elif framework == "jest":
+            cmd = f"npx jest {directory} --verbose"
+        elif framework == "unittest":
+            cmd = f"python3 -m unittest discover {directory} -v"
+        else:
+            return f"Error: Unknown test framework '{framework}'"
+
+        if guard:
+            return await _guarded_run(guard, agent_name, cmd, directory, timeout=120)
+        return _raw_run(cmd, directory, timeout=120)
+
+    return run_tests
+
+
+def get_code_runner_tools(guard=None, agent_name: str = "agent") -> list[Tool]:
+    """
+    Get all code runner tools.
+
+    Args:
+        guard: Optional CommandGuard for sandboxed execution.
+        agent_name: Name of the agent using these tools (for security checks).
+    """
     return [
         Tool(
             name="run_python",
@@ -153,7 +161,7 @@ def get_code_runner_tools() -> list[Tool]:
                 ToolParameter(name="code", type="string", description="Python code to execute"),
                 ToolParameter(name="cwd", type="string", description="Working directory", required=False, default="."),
             ],
-            function=_run_python,
+            function=_make_run_python(guard, agent_name),
         ),
         Tool(
             name="run_node",
@@ -163,7 +171,7 @@ def get_code_runner_tools() -> list[Tool]:
                 ToolParameter(name="code", type="string", description="JavaScript code to execute"),
                 ToolParameter(name="cwd", type="string", description="Working directory", required=False, default="."),
             ],
-            function=_run_node,
+            function=_make_run_node(guard, agent_name),
         ),
         Tool(
             name="run_command",
@@ -173,7 +181,7 @@ def get_code_runner_tools() -> list[Tool]:
                 ToolParameter(name="command", type="string", description="Shell command to run"),
                 ToolParameter(name="cwd", type="string", description="Working directory", required=False, default="."),
             ],
-            function=_run_command,
+            function=_make_run_command(guard, agent_name),
         ),
         Tool(
             name="install_package",
@@ -184,7 +192,7 @@ def get_code_runner_tools() -> list[Tool]:
                 ToolParameter(name="manager", type="string", description="Package manager: 'pip' or 'npm'", required=False, default="pip"),
                 ToolParameter(name="cwd", type="string", description="Working directory", required=False, default="."),
             ],
-            function=_install_package,
+            function=_make_install_package(guard, agent_name),
         ),
         Tool(
             name="run_tests",
@@ -194,6 +202,6 @@ def get_code_runner_tools() -> list[Tool]:
                 ToolParameter(name="directory", type="string", description="Directory containing tests"),
                 ToolParameter(name="framework", type="string", description="Test framework: 'pytest', 'jest', or 'unittest'", required=False, default="pytest"),
             ],
-            function=_run_tests,
+            function=_make_run_tests(guard, agent_name),
         ),
     ]
