@@ -19,9 +19,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
-from veska.core.agent import Agent, AgentConfig, AgentResult
+from veska.core.agent import Agent, AgentResult
 from veska.core.context_manager import ContextManager
 from veska.core.events import EventEmitter, EventType, Event
 from veska.core.memory import SharedMemory
@@ -29,6 +29,7 @@ from veska.core.message_bus import MessageBus, BusMessage, MessageType
 from veska.core.prompt_manager import PromptManager
 from veska.core.task_planner import TaskPlanner, Task, TaskStatus
 from veska.core.thinking import ThinkingHandler
+from veska.core.helpers import resolve_provider
 from veska.providers.base import BaseProvider, Message
 from veska.tools.base import Tool
 from veska.tools.delegation import create_delegation_tool
@@ -46,6 +47,9 @@ class OrchestratorConfig:
         thinking: Optional[dict] = None,
         interaction_level: str = "balanced",  # minimal, balanced, detailed
         storage_dir: Optional[str] = None,
+        # Clarification (off by default)
+        clarification_prompt: Optional[str] = None,
+        on_ask_user: Optional[Any] = None,
         # Delegation (off by default)
         allow_delegation: bool = False,
         delegation_timeout: int = 300,
@@ -62,6 +66,8 @@ class OrchestratorConfig:
         self.thinking = thinking or {}
         self.interaction_level = interaction_level
         self.storage_dir = storage_dir
+        self.clarification_prompt = clarification_prompt
+        self.on_ask_user = on_ask_user
         self.allow_delegation = allow_delegation
         self.delegation_timeout = delegation_timeout
         self.tracking = tracking
@@ -76,27 +82,51 @@ class Orchestrator:
     The brain of Veska. Manages the entire multi-agent workflow.
 
     Usage:
-        orch = Orchestrator(OrchestratorConfig(
-            provider=ClaudeProvider(model="claude-sonnet-4-6"),
-            tools=["file_manager", "code_runner", my_custom_tool],
-            agents={
-                "architect": architect_agent,
-                "backend": backend_agent,
-                "frontend": frontend_agent,
-            },
-        ))
+        orch = Orchestrator(
+            model="claude-sonnet-4-6",
+            agents=[researcher, writer],
+            tools=["file_manager"],
+        )
 
-        # Listen to events
-        orch.events.on(EventType.PROGRESS, my_progress_handler)
-        orch.events.on(EventType.CHECKPOINT, my_checkpoint_handler)
-
-        # Run
-        result = await orch.run("Build me a blog app")
+        result = orch.run("Build me a blog app")
     """
 
-    def __init__(self, config: OrchestratorConfig) -> None:
-        self.config = config
-        self.provider = config.provider
+    def __init__(
+        self,
+        *,
+        model: Optional[str] = None,
+        api_key: Optional[str] = None,
+        provider: Optional[BaseProvider] = None,
+        tools: Optional[list[str | Tool]] = None,
+        agents: Optional[list[Agent]] = None,
+        thinking: Optional[dict] = None,
+        interaction_level: str = "balanced",
+        storage_dir: Optional[str] = None,
+        clarification_prompt: Optional[str] = None,
+        on_ask_user: Optional[Any] = None,
+        allow_delegation: bool = False,
+        delegation_timeout: int = 300,
+        max_tokens: int = 8096,
+        tracking: Optional[dict] = None,
+        recovery: Optional[dict] = None,
+        security: Optional[dict] = None,
+        mcp_servers: Optional[list[dict]] = None,
+        logging: Optional[dict] = None,
+    ) -> None:
+        # Resolve provider: use passed provider, or create one from model/api_key
+        if provider:
+            self.provider = provider
+        elif model:
+            self.provider = resolve_provider(model=model, api_key=api_key, max_tokens=max_tokens)
+        else:
+            self.provider = resolve_provider(api_key=api_key, max_tokens=max_tokens)
+
+        # Store config values for internal use
+        self._clarification_prompt = clarification_prompt
+        self._on_ask_user = on_ask_user
+        self._interaction_level = interaction_level
+        self._allow_delegation = allow_delegation
+        self._delegation_timeout = delegation_timeout
 
         # Core systems
         self.message_bus = MessageBus()
@@ -105,23 +135,23 @@ class Orchestrator:
         self.task_planner = TaskPlanner()
         self.context = ContextManager(
             agent_id="orchestrator",
-            storage_dir=config.storage_dir,
+            storage_dir=storage_dir,
         )
 
         # Tool registry
         self.tool_registry = ToolRegistry()
-        for tool in config.tools:
+        for tool in (tools or []):
             self.tool_registry.register(tool)
 
-        # Agents
-        self._agents: dict[str, Agent] = dict(config.agents)
+        # Agents: build lookup dict from agent.name
+        self._agents: dict[str, Agent] = {a.name: a for a in (agents or [])}
 
         # Delegation
-        if config.allow_delegation and self._agents:
-            self._setup_delegation(config.delegation_timeout)
+        if allow_delegation and self._agents:
+            self._setup_delegation(delegation_timeout)
 
         # Thinking support for orchestrator's own planning
-        self._thinking = ThinkingHandler(**(config.thinking or {}))
+        self._thinking = ThinkingHandler(**(thinking or {}))
 
         # State
         self._status: str = "idle"  # idle, planning, running, paused, done, failed
@@ -137,6 +167,70 @@ class Orchestrator:
         self.events.on(EventType.RESUMED, self._on_resume)
         self.events.on(EventType.CANCELLED, self._on_cancel)
         self.events.on(EventType.USER_FEEDBACK, self._on_feedback)
+
+    # --- Clarification ---
+
+    async def _clarify(self, prompt: str) -> str:
+        """
+        Ask the user clarifying questions before planning.
+
+        Uses the developer's clarification_prompt to guide the AI on what to ask.
+        The AI decides if questions are needed based on the user's request.
+        Returns the user's answers to append to the prompt, or empty string if skipped.
+        """
+        if not self._clarification_prompt or not self._on_ask_user:
+            return ""
+
+        if not self.provider:
+            return ""
+
+        # Ask AI: "Given this user request and the developer's guidance, what questions should I ask?"
+        system = f"""You are the Orchestrator of an AI agent system.
+
+The developer has provided guidance on what to clarify before starting work:
+
+{self._clarification_prompt}
+
+Your job:
+1. Read the user's request below
+2. Decide if you have enough information to create a good plan
+3. If the request is already detailed enough, respond with exactly: NO_QUESTIONS_NEEDED
+4. If you need more info, respond with a clear, friendly message asking the user your questions. Keep it concise — only ask what's actually unclear. Number your questions."""
+
+        messages = [
+            Message(role="system", content=system),
+            Message(role="user", content=prompt),
+        ]
+
+        response = await self.provider.chat(messages=messages)
+        ai_response = response.content.strip()
+
+        # AI decided no questions needed
+        if "NO_QUESTIONS_NEEDED" in ai_response:
+            return ""
+
+        # Ask the user via the callback
+        import asyncio
+        import inspect
+
+        callback = self._on_ask_user
+
+        try:
+            if inspect.iscoroutinefunction(callback):
+                user_answer = await asyncio.wait_for(
+                    callback(ai_response), timeout=300
+                )
+            else:
+                user_answer = await asyncio.wait_for(
+                    asyncio.to_thread(callback, ai_response), timeout=300
+                )
+        except asyncio.TimeoutError:
+            return ""
+
+        if not user_answer:
+            return ""
+
+        return f"\n\nUser's clarifications:\n{user_answer}"
 
     # --- Delegation ---
 
@@ -182,7 +276,7 @@ class Orchestrator:
                         run_delegate=self._run_delegate,
                         self_name=agent_name,
                         current_depth=depth,
-                        timeout=self.config.delegation_timeout,
+                        timeout=self._delegation_timeout,
                     )
                     agent._tool_map[agent.tools[i].name] = agent.tools[i]
                     break
@@ -216,17 +310,19 @@ class Orchestrator:
 
     # --- Main execution ---
 
-    async def run(self, prompt: str) -> OrchestratorResult:
+    def run(self, prompt: str) -> OrchestratorResult:
         """
-        Main entry point. Takes a user prompt and orchestrates the full workflow.
+        Run the orchestrator. Handles everything internally.
 
-        Flow:
-          1. Plan: Use AI to break prompt into tasks
-          2. Checkpoint: Show plan to user for approval (if interaction level allows)
-          3. Execute: Run tasks in hybrid parallel/sequential order
-          4. Collect: Gather results from all agents
-          5. Done: Return final result
+        Args:
+            prompt: What you want the agents to do.
         """
+        import asyncio
+
+        return asyncio.run(self._run_async(prompt))
+
+    async def _run_async(self, prompt: str) -> OrchestratorResult:
+        """Internal async implementation."""
         self._status = "planning"
         self._cancelled = False
         self._paused = False
@@ -238,6 +334,11 @@ class Orchestrator:
         ))
 
         try:
+            # Step 0: Clarify (if developer set clarification_prompt)
+            clarifications = await self._clarify(prompt)
+            if clarifications:
+                prompt = prompt + clarifications
+
             # Step 1: Create the plan
             plan = await self._create_plan(prompt)
             if not plan:
@@ -248,7 +349,7 @@ class Orchestrator:
             self._current_plan = plan
 
             # Step 2: Checkpoint - show plan to user
-            if self.config.interaction_level != "minimal":
+            if self._interaction_level != "minimal":
                 checkpoint_response = await self.events.checkpoint(
                     checkpoint_id="plan_review",
                     title="Review Plan",
@@ -484,7 +585,7 @@ Respond with ONLY the JSON plan, no other text."""
 
             # Check for phase completion (checkpoint opportunity)
             current_phase = self.task_planner.get_current_phase()
-            if current_phase and self.config.interaction_level == "detailed":
+            if current_phase and self._interaction_level == "detailed":
                 prev_phase = self._get_previous_phase(current_phase.name)
                 if prev_phase and self.task_planner.is_phase_complete(prev_phase):
                     await self.events.checkpoint(

@@ -24,9 +24,11 @@ from typing import Any, AsyncGenerator, Optional, Type, Union
 from pydantic import BaseModel
 
 from veska.core.context_manager import ContextManager
+from veska.core.helpers import resolve_provider
 from veska.core.memory import AgentMemory
 from veska.core.prompt_manager import PromptManager
-from veska.core.structured import build_retry_message, build_schema_instructions, extract_and_validate
+from veska.core.format import strip_markdown
+from veska.core.structured import build_retry_message, build_schema_instructions, dict_to_model, extract_and_validate
 from veska.core.thinking import ThinkingHandler
 from veska.cache.store import CacheStore
 from veska.media.processor import process_attachments
@@ -74,12 +76,12 @@ class Agent:
     Base agent class for Veska framework.
 
     Usage:
-        agent = Agent(AgentConfig(
+        agent = Agent(
             name="backend_developer",
             system_prompt="You are a senior Python developer...",
-            provider=ClaudeProvider(model="claude-sonnet-4-6"),
+            provider=ClaudeProvider(api_key="your-key", model="claude-sonnet-4-6"),
             tools=[file_manager, code_runner],
-        ))
+        )
 
         # Bulk mode (default)
         result = await agent.run("Create user authentication API")
@@ -90,45 +92,78 @@ class Agent:
                 print(event.text, end="", flush=True)
     """
 
-    def __init__(self, config: AgentConfig) -> None:
+    def __init__(
+        self,
+        name: str = "",
+        *,
+        system_prompt: str = "",
+        model: Optional[str] = None,
+        api_key: Optional[str] = None,
+        provider: Optional[BaseProvider] = None,
+        tools: Optional[list] = None,
+        thinking: Optional[dict] = None,
+        max_iterations: int = 20,
+        max_tokens: int = 8096,
+        temperature: Optional[float] = None,
+        storage_dir: Optional[str] = None,
+        on_ask_user: Optional[Any] = None,
+        ask_user_timeout: int = 300,
+        memory_store: Optional[MemoryStore] = None,
+        cache: Optional[CacheStore] = None,
+        session_store: Optional[SessionStore] = None,
+        output_format: Optional[dict] = None,
+    ) -> None:
         self.id = str(uuid.uuid4())[:8]
-        self.name = config.name
-        self.provider = config.provider
-        self.max_iterations = config.max_iterations
+        self.name = name
 
-        # Tools
-        self.tools = list(config.tools)
+        # Structured output: convert dict format to Pydantic model internally
+        self._output_model = dict_to_model(output_format) if output_format else None
+
+        # Resolve provider: use passed provider, or create one from model/api_key
+        if provider:
+            self.provider = provider
+        elif model:
+            self.provider = resolve_provider(model=model, api_key=api_key, max_tokens=max_tokens, temperature=temperature)
+        else:
+            self.provider = resolve_provider(api_key=api_key, max_tokens=max_tokens, temperature=temperature)
+        self.max_iterations = max_iterations
+
+        # Tools: accept Tool objects or @tool-decorated functions
+        self.tools = [
+            t._tool if hasattr(t, "_tool") else t
+            for t in (tools or [])
+        ]
 
         # HITL: auto-register ask_user tool if callback provided
-        if config.on_ask_user:
+        if on_ask_user:
             self.tools.append(
-                create_ask_user_tool(config.on_ask_user, config.ask_user_timeout)
+                create_ask_user_tool(on_ask_user, ask_user_timeout)
             )
 
         self._tool_map: dict[str, Tool] = {t.name: t for t in self.tools}
 
         # Memory (private, with optional persistent store)
         self.memory = AgentMemory(agent_id=self.name)
-        self.memory_store = config.memory_store
+        self.memory_store = memory_store
 
         # Cache (optional, developer decides what to cache)
-        self.cache = config.cache
+        self.cache = cache
 
         # Sessions (optional, persists conversation threads)
-        self.session_store = config.session_store
+        self.session_store = session_store
 
         # Context manager
         self.context = ContextManager(
             agent_id=self.name,
-            storage_dir=config.storage_dir,
+            storage_dir=storage_dir,
         )
 
         # Thinking handler
-        self.thinking = ThinkingHandler(**config.thinking)
+        self.thinking = ThinkingHandler(**(thinking or {}))
 
         # Prompt manager
         self.prompt_manager = PromptManager(
-            developer_prompt=config.system_prompt,
+            developer_prompt=system_prompt,
             tools=self.tools,
         )
 
@@ -151,29 +186,71 @@ class Agent:
         self,
         task: str,
         context: str = "",
-        stream: bool = False,
+        stream: Union[bool, callable, None] = None,
         output_model: Optional[Type[BaseModel]] = None,
         attachments: Optional[list] = None,
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
-    ) -> Union[Any, AsyncGenerator[StreamEvent, None]]:
+    ) -> Any:
         """
-        Run a task. This is the main Think -> Decide -> Act -> Observe loop.
+        Run a task. Handles everything internally.
 
         Args:
             task: The task description.
-            context: Additional context (summaries from other tasks, etc.)
-            stream: If True, returns AsyncGenerator[StreamEvent].
-                    If False, returns AgentResult.
-            output_model: Optional Pydantic model class. Forces AI to return
-                         valid JSON matching this schema, with auto-retry.
+            context: Additional context.
+            stream: None/False = no streaming, returns result.
+                    True = stream tokens to console (print).
+                    callable = stream tokens to your function.
+            output_model: Optional Pydantic model for structured output.
             attachments: Optional list of file paths, URLs, or Image/PDF objects.
             user_id: Optional user identifier for session persistence.
             session_id: Optional session identifier for conversation resumption.
         """
+        import asyncio
+
+        # Use agent-level output_format if no explicit output_model passed
+        effective_model = output_model or self._output_model
+
         if stream:
-            return self._run_stream(task, context, output_model, attachments, user_id, session_id)
-        return self._run_bulk(task, context, output_model, attachments, user_id, session_id)
+            # Determine the callback
+            if stream is True:
+                callback = lambda text: print(text, end="", flush=True)
+            else:
+                callback = stream
+
+            return asyncio.run(
+                self._run_with_stream(callback, task, context, effective_model, attachments, user_id, session_id)
+            )
+
+        return asyncio.run(
+            self._run_bulk(task, context, effective_model, attachments, user_id, session_id)
+        )
+
+    async def _run_with_stream(
+        self,
+        callback: callable,
+        task: str,
+        context: str = "",
+        output_model: Optional[Type[BaseModel]] = None,
+        attachments: Optional[list] = None,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Any:
+        """Run with streaming, calling the callback for each text token."""
+        result = None
+        async for event in self._run_stream(task, context, output_model, attachments, user_id, session_id):
+            if event.type == "text_delta":
+                callback(strip_markdown(event.text))
+            elif event.type == "done":
+                result = AgentResult(
+                    agent_name=self.name,
+                    success=True,
+                    output=strip_markdown(event.response.content) if event.response else "",
+                    iterations=0,
+                )
+                if event.parsed_output:
+                    result.output = event.parsed_output.model_dump() if self._output_model and not output_model else event.parsed_output
+        return result
 
     async def _run_bulk(
         self, task: str, context: str = "", output_model: Optional[Type[BaseModel]] = None,
@@ -276,7 +353,7 @@ class Agent:
         return AgentResult(
             agent_name=self.name,
             success=True,
-            output=parsed_output if parsed_output else final_output,
+            output=parsed_output.model_dump() if parsed_output and self._output_model and not output_model else (parsed_output if parsed_output else strip_markdown(final_output)),
             iterations=iteration,
         )
 

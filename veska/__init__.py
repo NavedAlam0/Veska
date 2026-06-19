@@ -12,8 +12,8 @@ from veska.core.env import load_env as _load_env
 _load_env()
 
 # Core
-from veska.core.agent import Agent, AgentConfig, AgentResult
-from veska.core.orchestrator import Orchestrator, OrchestratorConfig, OrchestratorResult
+from veska.core.agent import Agent, AgentResult
+from veska.core.orchestrator import Orchestrator, OrchestratorResult
 from veska.core.message_bus import MessageBus, BusMessage, MessageType
 from veska.core.events import EventEmitter, EventType, Event
 from veska.core.memory import AgentMemory, SharedMemory
@@ -23,13 +23,12 @@ from veska.core.prompt_manager import PromptManager
 from veska.core.thinking import ThinkingHandler
 from veska.recovery.error_recovery import ErrorDetector, DiscussionRoom, FixCoordinator, FixReport
 
-# Providers
+# Providers (internal - users don't need these)
 from veska.providers.base import BaseProvider, Message, ProviderResponse, StreamEvent
-from veska.providers.claude_provider import ClaudeProvider
-from veska.providers.openai_provider import OpenAIProvider
 
 # Tools
 from veska.tools.base import Tool, ToolParameter, ToolResult
+from veska.tools.decorator import tool
 from veska.tools.registry import ToolRegistry
 from veska.tools.permissions import ToolPermissions
 
@@ -65,8 +64,8 @@ from veska.core.mcp_connector import MCPConnector, MCPServer
 
 __all__ = [
     # Core
-    "Agent", "AgentConfig", "AgentResult",
-    "Orchestrator", "OrchestratorConfig", "OrchestratorResult",
+    "Agent", "AgentResult",
+    "Orchestrator", "OrchestratorResult",
     "MessageBus", "BusMessage", "MessageType",
     "EventEmitter", "EventType", "Event",
     "AgentMemory", "SharedMemory",
@@ -75,11 +74,10 @@ __all__ = [
     "PromptManager",
     "ThinkingHandler",
     "ErrorDetector", "DiscussionRoom", "FixCoordinator", "FixReport",
-    # Providers
+    # Providers (internal)
     "BaseProvider", "Message", "ProviderResponse", "StreamEvent",
-    "ClaudeProvider", "OpenAIProvider",
     # Tools
-    "Tool", "ToolParameter", "ToolResult",
+    "Tool", "ToolParameter", "ToolResult", "tool",
     "ToolRegistry", "ToolPermissions",
     # Sessions
     "SessionStore", "FileSessionStore", "SQLiteSessionStore",

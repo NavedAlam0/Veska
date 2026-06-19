@@ -41,6 +41,7 @@ class ClaudeProvider(BaseProvider):
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         max_tokens: int = 8096,
+        temperature: Optional[float] = None,
         **kwargs: Any,
     ) -> None:
         key = api_key or get_env("ANTHROPIC_API_KEY", "")
@@ -48,6 +49,7 @@ class ClaudeProvider(BaseProvider):
 
         super().__init__(api_key=key, model=resolved_model, **kwargs)
         self.max_tokens = max_tokens
+        self.temperature = temperature
         self.client = anthropic.AsyncAnthropic(api_key=key)
 
     @property
@@ -131,6 +133,9 @@ class ClaudeProvider(BaseProvider):
 
         if system_prompt:
             api_kwargs["system"] = system_prompt
+
+        if self.temperature is not None:
+            api_kwargs["temperature"] = self.temperature
 
         if tools:
             api_kwargs["tools"] = tools

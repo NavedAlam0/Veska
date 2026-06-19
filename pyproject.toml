@@ -1,18 +1,41 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "veska"
 version = "0.1.0"
-description = "Veska - A multi-agent framework built from scratch"
+description = "A multi-agent AI framework built from scratch in Python"
+readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.10"
+authors = [
+    {name = "Naved Alam", email = "navedalam2234@gmail.com"},
+]
+keywords = ["ai", "agents", "multi-agent", "framework", "llm", "claude", "openai"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "anthropic>=0.39.0",
     "openai>=1.50.0",
-    "asyncio-pool>=0.6.0",
     "pydantic>=2.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/NavedAlam0/Veska"
+Repository = "https://github.com/NavedAlam0/Veska"
+Documentation = "https://github.com/NavedAlam0/Veska"
 
 [project.optional-dependencies]
 dev = [

@@ -17,6 +17,21 @@ from typing import Any, Optional, Type
 from pydantic import BaseModel, ValidationError
 
 
+def dict_to_model(output_format: dict[str, type]) -> Type[BaseModel]:
+    """Convert a simple dictionary of {field_name: type} into a Pydantic model.
+
+    Example:
+        {"title": str, "rating": float} becomes a Pydantic model with those fields.
+    """
+    TYPE_MAP = {str: str, int: int, float: float, bool: bool, list: list, dict: dict}
+    fields = {}
+    for field_name, field_type in output_format.items():
+        resolved = TYPE_MAP.get(field_type, field_type)
+        fields[field_name] = (resolved, ...)
+
+    return type("OutputModel", (BaseModel,), {"__annotations__": {k: v[0] for k, v in fields.items()}})
+
+
 def build_schema_instructions(model_class: Type[BaseModel]) -> str:
     """Build prompt instructions from a Pydantic model class."""
     schema = model_class.model_json_schema()
