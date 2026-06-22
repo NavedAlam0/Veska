@@ -18,6 +18,8 @@ PREBUILT_TOOLS = {
     "code_runner",
     "project_tools",
     "web_tools",
+    "google_search",
+    "bing_search",
     "database_tools",
     "api_tools",
 }
@@ -158,6 +160,8 @@ def _load_prebuilt(name: str) -> list[Tool]:
         "code_runner": _load_code_runner_tools,
         "project_tools": _load_project_tools,
         "web_tools": _load_web_tools,
+        "google_search": _load_google_search_tools,
+        "bing_search": _load_bing_search_tools,
         "database_tools": _load_database_tools,
         "api_tools": _load_api_tools,
     }
@@ -183,9 +187,19 @@ def _load_project_tools() -> list[Tool]:
     return get_project_tools()
 
 
-# Optional tools - placeholders until implemented
 def _load_web_tools() -> list[Tool]:
-    return []
+    from veska.tools.web_search import get_web_tools
+    return get_web_tools()
+
+
+def _load_google_search_tools() -> list[Tool]:
+    from veska.tools.google_search import get_google_search_tools
+    return get_google_search_tools()
+
+
+def _load_bing_search_tools() -> list[Tool]:
+    from veska.tools.bing_search import get_bing_search_tools
+    return get_bing_search_tools()
 
 
 def _load_database_tools() -> list[Tool]:
