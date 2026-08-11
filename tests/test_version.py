@@ -1,9 +1,13 @@
 """Tests for package metadata consistency."""
 
-import tomllib
 from pathlib import Path
 
 import veska
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 
 def test_package_version_matches_pyproject():
