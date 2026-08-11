@@ -105,7 +105,11 @@ class OpenAIProvider(BaseProvider):
                     # Multi-modal content blocks
                     openai_messages.append({
                         "role": msg.role,
-                        "content": _to_openai_content_blocks(msg.content),
+                        "content": _to_openai_content_blocks(
+                            msg.content,
+                            supports_audio_input=self.supports_audio_input(),
+                            supported_audio_formats=self.supported_audio_formats(),
+                        ),
                     })
                 else:
                     openai_messages.append({
@@ -130,6 +134,15 @@ class OpenAIProvider(BaseProvider):
             api_kwargs["stream_options"] = {"include_usage": True}
 
         return api_kwargs
+
+    def supports_audio_input(self) -> bool:
+        """Return whether the selected OpenAI model accepts audio input."""
+        model = (self.model or "").lower()
+        return "audio" in model
+
+    def supported_audio_formats(self) -> set[str]:
+        """Audio formats accepted directly by OpenAI chat audio input."""
+        return {"wav", "mp3"} if self.supports_audio_input() else set()
 
     async def _stream(
         self,
@@ -238,7 +251,11 @@ class OpenAIProvider(BaseProvider):
         )
 
 
-def _to_openai_content_blocks(blocks: list[dict]) -> list[dict]:
+def _to_openai_content_blocks(
+    blocks: list[dict],
+    supports_audio_input: bool = False,
+    supported_audio_formats: Optional[set[str]] = None,
+) -> list[dict]:
     """Convert processor content blocks to OpenAI API format."""
     openai_blocks = []
 
@@ -272,5 +289,32 @@ def _to_openai_content_blocks(blocks: list[dict]) -> list[dict]:
                 "type": "text",
                 "text": "[PDF document attached — text extraction required for OpenAI]",
             })
+
+        elif block["type"] == "audio":
+            audio_format = block.get("format", "").lower()
+            accepted_formats = supported_audio_formats or set()
+            if (
+                supports_audio_input
+                and block.get("source_type") == "base64"
+                and audio_format in accepted_formats
+            ):
+                openai_blocks.append({
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": block["data"],
+                        "format": audio_format,
+                    },
+                })
+            else:
+                source = block.get("url") or block.get("filename") or "audio attachment"
+                openai_blocks.append({
+                    "type": "text",
+                    "text": (
+                        f"[Audio attached: {source}. The selected OpenAI model "
+                        "does not accept this audio input directly. Use an "
+                        "audio-capable OpenAI model with local/base64 wav or mp3 "
+                        "audio, or provide a transcript.]"
+                    ),
+                })
 
     return openai_blocks

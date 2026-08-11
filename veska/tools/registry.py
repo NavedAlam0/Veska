@@ -18,6 +18,7 @@ PREBUILT_TOOLS = {
     "code_runner",
     "project_tools",
     "web_tools",
+    "code_scanner",
     "google_search",
     "bing_search",
     "database_tools",
@@ -153,13 +154,12 @@ def _load_prebuilt(name: str) -> list[Tool]:
     Returns a list because one tool group (like "file_manager")
     can contain multiple individual tools.
     """
-    # Will be implemented when we build pre-built tools in Step 13
-    # For now, return empty list as placeholder
     loaders = {
         "file_manager": _load_file_manager_tools,
         "code_runner": _load_code_runner_tools,
         "project_tools": _load_project_tools,
         "web_tools": _load_web_tools,
+        "code_scanner": _load_code_scanner_tools,
         "google_search": _load_google_search_tools,
         "bing_search": _load_bing_search_tools,
         "database_tools": _load_database_tools,
@@ -190,6 +190,11 @@ def _load_project_tools() -> list[Tool]:
 def _load_web_tools() -> list[Tool]:
     from veska.tools.web_search import get_web_tools
     return get_web_tools()
+
+
+def _load_code_scanner_tools() -> list[Tool]:
+    from veska.tools.code_scanner import get_code_scanner_tools
+    return get_code_scanner_tools()
 
 
 def _load_google_search_tools() -> list[Tool]:

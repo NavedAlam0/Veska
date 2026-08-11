@@ -119,3 +119,11 @@ class BaseProvider(ABC):
     def supports_thinking(self) -> bool:
         """Whether this provider/model supports extended thinking."""
         ...
+
+    def supports_audio_input(self) -> bool:
+        """Whether this provider/model accepts raw audio input."""
+        return False
+
+    def supported_audio_formats(self) -> set[str]:
+        """Audio formats this provider/model accepts directly."""
+        return set()

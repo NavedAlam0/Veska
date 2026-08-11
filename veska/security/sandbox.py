@@ -194,14 +194,9 @@ class Sandbox:
         # Zone 2: Inside project
         zone = self._zones.get(agent_name)
         if not zone:
-            # Agent has no territory defined - allow read, block write inside project
-            if mode == "read":
-                return SecurityResult(allowed=True)
-            return SecurityResult(
-                allowed=False,
-                reason=f"Agent '{agent_name}' has no territory defined.",
-                zone="project",
-            )
+            # Agent has no territory defined - allow access inside the project.
+            # Territories are optional and only needed for stricter per-agent ownership.
+            return SecurityResult(allowed=True)
 
         # Write access - must be inside own territory
         if mode == "write":

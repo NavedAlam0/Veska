@@ -2,7 +2,7 @@
 
 ![CI](https://github.com/NavedAlam0/Veska/actions/workflows/ci.yml/badge.svg)
 
-A multi-agent AI framework built from scratch in Python. No LangChain, no CrewAI, no AutoGen — 100% custom-built for full control.
+Veska is a Python framework for building agent and multi-agent workflows with tools, MCP, logging, cost tracking, recovery, and security controls.
 
 ## Install
 
@@ -13,112 +13,154 @@ pip install veska
 ## Quick Start
 
 ```python
-from veska import Agent
-
-agent = Agent(
-    name="assistant",
-    system_prompt="You are a helpful coding assistant.",
-    model="claude-sonnet-4-6",
-)
-
-result = agent.run("Explain what a decorator is in Python")
-print(result.output)
-```
-
-## Add Tools
-
-```python
-from veska import Agent, tool
-
-@tool
-def get_weather(city: str):
-    return f"Weather in {city}: 72°F, sunny"
-
-agent = Agent(
-    name="weather-bot",
-    system_prompt="You help users check the weather. Use the get_weather tool.",
-    model="claude-sonnet-4-6",
-    tools=[get_weather],
-)
-
-result = agent.run("What's the weather in Paris?")
-print(result.output)
-```
-
-## Structured Output
-
-```python
-from veska import Agent
-
-agent = Agent(
-    name="reviewer",
-    system_prompt="You review movies.",
-    model="claude-sonnet-4-6",
-    output_format={
-        "title": str,
-        "rating": float,
-        "recommend": bool,
-    }
-)
-
-result = agent.run("Review the movie Inception")
-print(result.output["title"])      # "Inception"
-print(result.output["rating"])     # 9.0
-```
-
-## Streaming
-
-```python
-result = agent.run("Write a haiku about coding", stream=True)
-```
-
-## Multi-Agent System
-
-```python
 from veska import Agent, Orchestrator
 
-researcher = Agent(
-    name="researcher",
-    system_prompt="You research topics thoroughly.",
-    model="claude-sonnet-4-6",
-)
-
-writer = Agent(
-    name="writer",
-    system_prompt="You write clear, engaging content.",
-    model="claude-sonnet-4-6",
-)
-
-orchestrator = Orchestrator(
-    model="claude-sonnet-4-6",
-    agents=[researcher, writer],
+frontend = Agent(
+    name="frontend",
+    system_prompt="Build frontend UI.",
+    model="gpt-4o",
     tools=["file_manager"],
 )
 
-result = orchestrator.run("Write a blog post about AI agents")
+backend = Agent(
+    name="backend",
+    system_prompt="Build backend APIs.",
+    model="gpt-4o",
+    tools=["file_manager", "code_runner"],
+)
+
+orchestrator = Orchestrator(
+    model="gpt-4o",
+    agents=[frontend, backend],
+)
+
+result = orchestrator.run("Build a small blog app")
 print(result.results)
 ```
 
-## Per-Agent Models
+## Tools
+
+Tools passed to an agent belong to that agent:
 
 ```python
-researcher = Agent(name="researcher", model="claude-sonnet-4-6")
-writer = Agent(name="writer", model="gpt-4o")
+agent = Agent(
+    model="gpt-4o",
+    tools=["file_manager", "code_runner", "code_scanner"],
+)
 ```
+
+Tools passed to the orchestrator stay with the orchestrator by default:
+
+```python
+orchestrator = Orchestrator(
+    model="gpt-4o",
+    tools=["code_scanner"],
+)
+```
+
+To share orchestrator tools and orchestrator MCP tools with agents:
+
+```python
+orchestrator = Orchestrator(
+    tools=["code_scanner"],
+    mcp_servers=[github],
+    share_tools_with_agents=True,
+)
+```
+
+## MCP
+
+MCP can be connected directly to an agent or to the orchestrator:
+
+```python
+from veska import MCPServer
+
+github = MCPServer(
+    name="github",
+    command="npx",
+    args=["-y", "@modelcontextprotocol/server-github"],
+    env={"GITHUB_TOKEN": "..."},
+)
+
+agent = Agent(model="gpt-4o", mcp_servers=[github])
+orchestrator = Orchestrator(model="gpt-4o", mcp_servers=[github])
+```
+
+## Logging And Cost Tracking
+
+Logging and cost tracking are explicit objects:
+
+```python
+from veska import CostTracker, Logger
+
+logger = Logger(enabled=True)
+cost_tracker = CostTracker(enabled=True)
+
+orchestrator = Orchestrator(
+    model="gpt-4o",
+    logger=logger,
+    cost_tracker=cost_tracker,
+)
+```
+
+## Recovery
+
+Use recovery when workflows should continue after interruption:
+
+```python
+from veska import RecoveryManager
+
+recovery = RecoveryManager(enabled=True)
+
+orchestrator = Orchestrator(
+    model="gpt-4o",
+    agents=[frontend, backend],
+    recovery=recovery,
+)
+
+result = orchestrator.run_or_resume("Build a small blog app")
+```
+
+## Security
+
+Security protects project boundaries and guards built-in file/command tools:
+
+```python
+orchestrator = Orchestrator(
+    model="gpt-4o",
+    agents=[frontend, backend],
+    security={"enabled": True, "project_root": "/path/to/project"},
+)
+```
+
+Territories are optional. Use them only when agents should be limited to separate folders.
+
+## Media
+
+Agents can receive attachments:
+
+```python
+from veska import Audio, Image, PDF
+
+result = agent.run(
+    "Answer using these files",
+    attachments=[Audio("voice.mp3"), Image("screen.png"), PDF("brief.pdf")],
+)
+```
+
+Audio is sent only through the selected provider/model. If that model does not support raw audio, Veska returns an error before calling the provider.
 
 ## Features
 
-- **Multi-Agent Orchestration** — Orchestrator breaks tasks into a dependency graph, runs them in parallel/sequential order
-- **Multi-Model Support** — Claude and OpenAI, configurable per agent
-- **Unified Tool System** — Pre-built, custom, and MCP tools. Just use `@tool` decorator
-- **Streaming** — `stream=True` or `stream=callback`
-- **Structured Output** — Pass `output_format` dict, get validated responses
-- **Memory System** — Private memory per agent + shared memory pool
-- **3-Level Error Recovery** — Auto-retry, agent-level fix, discussion room
-- **Security Sandboxing** — Agents sandboxed to their own territory
-- **Extended Thinking** — Optional per-agent thinking support
-- **MCP Support** — Connect external services via Model Context Protocol
-- **General Purpose** — Not locked to any use case
+- Multi-agent orchestration with dependency-aware task execution
+- Agent-level and orchestrator-level tools
+- Agent-level and orchestrator-level MCP
+- Optional structured logging and cost tracking
+- Recovery savepoints with `run_or_resume`
+- Security sandbox for built-in file and command tools
+- Optional built-in `code_scanner` tool
+- Image, PDF, and audio attachments
+- Structured output, streaming, memory, and thinking support
 
 ## Requirements
 

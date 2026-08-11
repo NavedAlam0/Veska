@@ -1,7 +1,7 @@
 """
 Multi-modal attachment processor.
 
-Handles both simple path (strings) and explicit path (Image/PDF objects).
+Handles both simple path (strings) and explicit path (Image/PDF/Audio objects).
 Converts everything into provider-agnostic content blocks.
 """
 
@@ -20,6 +20,9 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 # Supported document extensions
 PDF_EXTENSIONS = {".pdf"}
 
+# Supported audio extensions
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm"}
+
 # Mime type mapping for images
 MIME_TYPES = {
     ".png": "image/png",
@@ -28,6 +31,15 @@ MIME_TYPES = {
     ".gif": "image/gif",
     ".webp": "image/webp",
     ".bmp": "image/bmp",
+}
+
+AUDIO_MIME_TYPES = {
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg",
+    ".flac": "audio/flac",
+    ".webm": "audio/webm",
 }
 
 
@@ -77,6 +89,8 @@ def _process_string(source: str) -> list[dict]:
         return _process_image(Image(source))
     elif ext in PDF_EXTENSIONS:
         return _process_pdf(PDF(source))
+    elif ext in AUDIO_EXTENSIONS:
+        return _process_audio(Audio(source))
     else:
         # Unknown type — try as image
         return _process_image(Image(source))
@@ -143,8 +157,54 @@ def _process_pdf(pdf: PDF) -> list[dict]:
 
 
 def _process_audio(audio: Audio) -> list[dict]:
-    """Process audio — placeholder for V3."""
-    return [{"type": "text", "text": f"[Audio file: {audio.source} (not yet supported)]"}]
+    """Process audio into a provider-agnostic content block."""
+    if audio.content is not None:
+        data = (
+            audio.content
+            if isinstance(audio.content, str)
+            else base64.b64encode(audio.content).decode("utf-8")
+        )
+        audio_format = _normalize_audio_format(audio.format or "")
+        media_type = audio.media_type or _audio_media_type_from_format(audio_format)
+        return [{
+            "type": "audio",
+            "source_type": "base64",
+            "data": data,
+            "format": audio_format,
+            "media_type": media_type,
+            "language": audio.language,
+        }]
+
+    source = audio.source
+    if not source:
+        return [{"type": "text", "text": "[Error: Audio source or content is required]"}]
+
+    if _is_url(source):
+        audio_format = _normalize_audio_format(audio.format or _url_extension(source).lstrip("."))
+        return [{
+            "type": "audio",
+            "source_type": "url",
+            "url": source,
+            "format": audio_format,
+            "media_type": audio.media_type or _guess_audio_mime(source),
+            "language": audio.language,
+        }]
+
+    path = Path(source)
+    if not path.exists():
+        return [{"type": "text", "text": f"[Error: File not found: {source}]"}]
+
+    data = base64.b64encode(path.read_bytes()).decode("utf-8")
+    audio_format = _normalize_audio_format(audio.format or path.suffix.lstrip("."))
+    return [{
+        "type": "audio",
+        "source_type": "base64",
+        "data": data,
+        "format": audio_format,
+        "media_type": audio.media_type or AUDIO_MIME_TYPES.get(path.suffix.lower(), "audio/mpeg"),
+        "language": audio.language,
+        "filename": path.name,
+    }]
 
 
 def _extract_pdf_text(path: Path, pages: list[int] | None = None) -> str | None:
@@ -200,3 +260,22 @@ def _guess_mime(source: str) -> str:
     """Guess MIME type from source path/URL."""
     ext = Path(source).suffix.lower() if not _is_url(source) else _url_extension(source)
     return MIME_TYPES.get(ext, "image/png")
+
+
+def _guess_audio_mime(source: str) -> str:
+    """Guess audio MIME type from source path/URL."""
+    ext = Path(source).suffix.lower() if not _is_url(source) else _url_extension(source)
+    return AUDIO_MIME_TYPES.get(ext, "audio/mpeg")
+
+
+def _normalize_audio_format(format_value: str) -> str:
+    """Normalize audio format for provider adapters."""
+    value = format_value.lower().strip().lstrip(".")
+    if value == "mpeg":
+        return "mp3"
+    return value or "mp3"
+
+
+def _audio_media_type_from_format(format_value: str) -> str:
+    """Return a MIME type from an audio format."""
+    return AUDIO_MIME_TYPES.get(f".{format_value}", "audio/mpeg")

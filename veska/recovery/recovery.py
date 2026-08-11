@@ -235,6 +235,14 @@ class RecoveryManager:
                 task.status = TaskStatus.READY
                 task.started_at = None
                 resumable.append(task)
+            elif task.status == TaskStatus.FAILED and task.can_retry:
+                task.status = TaskStatus.RETRYING
+                task.retries += 1
+                task.error = None
+                task.result = None
+                task.started_at = None
+                task.completed_at = None
+                resumable.append(task)
             elif task.status in (TaskStatus.WAITING, TaskStatus.READY):
                 resumable.append(task)
         return resumable

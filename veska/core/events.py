@@ -14,6 +14,7 @@ Engine doesn't care if dashboard is digital, analog, or a phone app.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from enum import Enum
 from typing import Any, Callable, Coroutine, Optional
@@ -155,7 +156,7 @@ class EventEmitter:
 
     def on(self, event_type: EventType, handler: EventHandler | SyncEventHandler) -> None:
         """Register a handler for a specific event type."""
-        if asyncio.iscoroutinefunction(handler):
+        if inspect.iscoroutinefunction(handler):
             if event_type not in self._handlers:
                 self._handlers[event_type] = []
             self._handlers[event_type].append(handler)
@@ -166,7 +167,7 @@ class EventEmitter:
 
     def on_any(self, handler: EventHandler | SyncEventHandler) -> None:
         """Register a handler that receives ALL events."""
-        if asyncio.iscoroutinefunction(handler):
+        if inspect.iscoroutinefunction(handler):
             self._any_handlers.append(handler)
         else:
             self._sync_any_handlers.append(handler)

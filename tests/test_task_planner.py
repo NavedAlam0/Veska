@@ -1,6 +1,62 @@
 """Tests for the Task Planner — dependency graph and execution order."""
 
+import asyncio
+import json
+
+from veska.core.agent import Agent
+from veska.core.orchestrator import Orchestrator
 from veska.core.task_planner import Task, TaskPlanner, TaskStatus
+from veska.providers.base import BaseProvider, Message, ProviderResponse, ThinkingConfig
+
+
+class StaticProvider(BaseProvider):
+    """Provider test double that avoids real API calls while using real Agent objects."""
+
+    def __init__(self, output: str):
+        super().__init__(api_key="", model="test-model")
+        self.output = output
+
+    async def chat(
+        self,
+        messages: list[Message],
+        tools: list[dict] | None = None,
+        thinking: ThinkingConfig | None = None,
+        stream: bool = False,
+        **kwargs,
+    ) -> ProviderResponse:
+        return ProviderResponse(content=self.output, model=self.model)
+
+    @property
+    def provider_name(self) -> str:
+        return "test"
+
+    def supports_thinking(self) -> bool:
+        return False
+
+
+class PlanningProvider(BaseProvider):
+    """Returns a fixed plan for the orchestrator planning call."""
+
+    def __init__(self, plan: dict):
+        super().__init__(api_key="", model="test-planner")
+        self.plan = plan
+
+    async def chat(
+        self,
+        messages: list[Message],
+        tools: list[dict] | None = None,
+        thinking: ThinkingConfig | None = None,
+        stream: bool = False,
+        **kwargs,
+    ) -> ProviderResponse:
+        return ProviderResponse(content=json.dumps(self.plan), model=self.model)
+
+    @property
+    def provider_name(self) -> str:
+        return "test"
+
+    def supports_thinking(self) -> bool:
+        return False
 
 
 def test_independent_tasks_run_in_parallel():
@@ -147,3 +203,67 @@ def test_is_complete():
     assert not p.is_complete
     p.complete_task("b", "done")
     assert p.is_complete
+
+
+def test_orchestrator_runs_agent_with_async_entrypoint():
+    """Orchestrator must call arun() because _run_task runs inside async code."""
+
+    agent = Agent(name="worker", provider=StaticProvider("done: Build feature"))
+    orchestrator = Orchestrator(provider=object())
+    orchestrator.register_agent(agent)
+
+    task = Task(id="t1", name="Build", description="Build feature", agent=agent.name)
+    orchestrator.task_planner.add_task(task)
+
+    asyncio.run(orchestrator._run_task(task))
+
+    assert orchestrator.task_planner.get_task("t1").status == TaskStatus.DONE
+    assert orchestrator.task_planner.get_task("t1").result == "done: Build feature"
+
+
+def test_orchestrator_delegation_uses_async_entrypoint():
+    """Delegated work must also call arun(), not the sync run() wrapper."""
+
+    agent = Agent(name="delegate", provider=StaticProvider("delegated: Handle subtask"))
+    orchestrator = Orchestrator(provider=object())
+    orchestrator.register_agent(agent)
+
+    result = asyncio.run(
+        orchestrator._run_delegate(agent_name=agent.name, task="Handle subtask", depth=0)
+    )
+
+    assert result == "delegated: Handle subtask"
+
+
+def test_orchestrator_default_interaction_level_does_not_wait_for_checkpoint():
+    """Default orchestrator runs should not hang waiting for plan approval."""
+
+    plan = {
+        "name": "Test Plan",
+        "description": "Run one task",
+        "phases": [
+            {
+                "name": "Execution",
+                "description": "Execute task",
+                "tasks": [
+                    {
+                        "id": "main",
+                        "name": "Main task",
+                        "description": "Do the work",
+                        "agent": "worker",
+                        "depends_on": [],
+                    }
+                ],
+            }
+        ],
+    }
+    agent = Agent(name="worker", provider=StaticProvider("task complete"))
+    orchestrator = Orchestrator(provider=PlanningProvider(plan), agents=[agent])
+
+    result = asyncio.run(
+        asyncio.wait_for(orchestrator.arun("Do the work"), timeout=1)
+    )
+
+    assert result.success
+    assert result.progress["completed"] == 1
+    assert orchestrator.events.stats["pending_checkpoints"] == 0

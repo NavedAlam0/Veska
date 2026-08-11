@@ -59,6 +59,14 @@ class ClaudeProvider(BaseProvider):
     def supports_thinking(self) -> bool:
         return self.model in THINKING_MODELS
 
+    def supports_audio_input(self) -> bool:
+        """Return whether the selected Claude model accepts raw audio input."""
+        return False
+
+    def supported_audio_formats(self) -> set[str]:
+        """Audio formats accepted directly by this Claude provider path."""
+        return set()
+
     async def chat(
         self,
         messages: list[Message],
@@ -290,5 +298,16 @@ def _to_claude_content_blocks(blocks: list[dict]) -> list[dict]:
                         "data": block["data"],
                     },
                 })
+
+        elif block["type"] == "audio":
+            source = block.get("url") or block.get("filename") or "audio attachment"
+            claude_blocks.append({
+                "type": "text",
+                "text": (
+                    f"[Audio attached: {source}. This Claude provider path does "
+                    "not currently send raw audio; use an audio-capable OpenAI "
+                    "model or provide a transcript.]"
+                ),
+            })
 
     return claude_blocks

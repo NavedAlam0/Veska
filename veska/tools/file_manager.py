@@ -98,7 +98,63 @@ def _search_files(directory: str, query: str) -> str:
     return f"Search results for '{query}':\n" + "\n".join(results)
 
 
-def get_file_manager_tools() -> list[Tool]:
+def _check_path(sandbox, agent_name: str, path: str, mode: str) -> None:
+    if not sandbox:
+        return
+    result = sandbox.check_path_access(agent_name, path, mode)
+    if not result.allowed:
+        raise PermissionError(result.reason)
+
+
+def _make_create_file(sandbox=None, agent_name: str = "agent"):
+    def create_file(path: str, content: str) -> str:
+        _check_path(sandbox, agent_name, path, "write")
+        return _create_file(path, content)
+
+    return create_file
+
+
+def _make_read_file(sandbox=None, agent_name: str = "agent"):
+    def read_file(path: str) -> str:
+        _check_path(sandbox, agent_name, path, "read")
+        return _read_file(path)
+
+    return read_file
+
+
+def _make_edit_file(sandbox=None, agent_name: str = "agent"):
+    def edit_file(path: str, old_text: str, new_text: str) -> str:
+        _check_path(sandbox, agent_name, path, "write")
+        return _edit_file(path, old_text, new_text)
+
+    return edit_file
+
+
+def _make_delete_file(sandbox=None, agent_name: str = "agent"):
+    def delete_file(path: str) -> str:
+        _check_path(sandbox, agent_name, path, "write")
+        return _delete_file(path)
+
+    return delete_file
+
+
+def _make_list_files(sandbox=None, agent_name: str = "agent"):
+    def list_files(directory: str, pattern: str = "*") -> str:
+        _check_path(sandbox, agent_name, directory, "read")
+        return _list_files(directory, pattern)
+
+    return list_files
+
+
+def _make_search_files(sandbox=None, agent_name: str = "agent"):
+    def search_files(directory: str, query: str) -> str:
+        _check_path(sandbox, agent_name, directory, "read")
+        return _search_files(directory, query)
+
+    return search_files
+
+
+def get_file_manager_tools(sandbox=None, agent_name: str = "agent") -> list[Tool]:
     """Get all file manager tools."""
     return [
         Tool(
@@ -109,7 +165,7 @@ def get_file_manager_tools() -> list[Tool]:
                 ToolParameter(name="path", type="string", description="File path to create"),
                 ToolParameter(name="content", type="string", description="Content to write"),
             ],
-            function=_create_file,
+            function=_make_create_file(sandbox, agent_name),
         ),
         Tool(
             name="read_file",
@@ -118,7 +174,7 @@ def get_file_manager_tools() -> list[Tool]:
             parameters=[
                 ToolParameter(name="path", type="string", description="File path to read"),
             ],
-            function=_read_file,
+            function=_make_read_file(sandbox, agent_name),
         ),
         Tool(
             name="edit_file",
@@ -129,7 +185,7 @@ def get_file_manager_tools() -> list[Tool]:
                 ToolParameter(name="old_text", type="string", description="Text to find and replace"),
                 ToolParameter(name="new_text", type="string", description="Replacement text"),
             ],
-            function=_edit_file,
+            function=_make_edit_file(sandbox, agent_name),
         ),
         Tool(
             name="delete_file",
@@ -138,7 +194,7 @@ def get_file_manager_tools() -> list[Tool]:
             parameters=[
                 ToolParameter(name="path", type="string", description="File path to delete"),
             ],
-            function=_delete_file,
+            function=_make_delete_file(sandbox, agent_name),
         ),
         Tool(
             name="list_files",
@@ -148,7 +204,7 @@ def get_file_manager_tools() -> list[Tool]:
                 ToolParameter(name="directory", type="string", description="Directory path to list"),
                 ToolParameter(name="pattern", type="string", description="Glob pattern to filter", required=False, default="*"),
             ],
-            function=_list_files,
+            function=_make_list_files(sandbox, agent_name),
         ),
         Tool(
             name="search_files",
@@ -158,6 +214,6 @@ def get_file_manager_tools() -> list[Tool]:
                 ToolParameter(name="directory", type="string", description="Directory to search in"),
                 ToolParameter(name="query", type="string", description="Text to search for"),
             ],
-            function=_search_files,
+            function=_make_search_files(sandbox, agent_name),
         ),
     ]

@@ -5,7 +5,7 @@ General purpose framework for building multi-agent systems.
 Supports Claude API and OpenAI API with per-agent configuration.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # Auto-load .env file on import (searches cwd and parent dirs)
 from veska.core.env import load_env as _load_env

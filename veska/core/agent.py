@@ -37,6 +37,10 @@ from veska.sessions.store import SessionStore
 from veska.providers.base import BaseProvider, Message, ProviderResponse, StreamEvent
 from veska.tools.base import Tool, ToolResult
 from veska.tools.human import create_ask_user_tool
+from veska.tools.registry import ToolRegistry
+from veska.logging.logger import Logger
+from veska.tracking.cost_tracker import CostTracker
+from veska.core.mcp_connector import MCPConnector, MCPServer
 
 
 class AgentConfig:
@@ -47,7 +51,7 @@ class AgentConfig:
         name: str,
         system_prompt: str = "",
         provider: Optional[BaseProvider] = None,
-        tools: Optional[list[Tool]] = None,
+        tools: Optional[list[str | Tool]] = None,
         thinking: Optional[dict] = None,
         max_iterations: int = 20,
         storage_dir: Optional[str] = None,
@@ -56,6 +60,9 @@ class AgentConfig:
         memory_store: Optional[MemoryStore] = None,
         cache: Optional[CacheStore] = None,
         session_store: Optional[SessionStore] = None,
+        logger: Optional[Logger] = None,
+        cost_tracker: Optional[CostTracker] = None,
+        mcp_servers: Optional[list[dict | MCPServer]] = None,
     ) -> None:
         self.name = name
         self.system_prompt = system_prompt
@@ -69,6 +76,9 @@ class AgentConfig:
         self.memory_store = memory_store
         self.cache = cache
         self.session_store = session_store
+        self.logger = logger
+        self.cost_tracker = cost_tracker
+        self.mcp_servers = mcp_servers or []
 
 
 class Agent:
@@ -112,6 +122,9 @@ class Agent:
         cache: Optional[CacheStore] = None,
         session_store: Optional[SessionStore] = None,
         output_format: Optional[dict] = None,
+        logger: Optional[Logger] = None,
+        cost_tracker: Optional[CostTracker] = None,
+        mcp_servers: Optional[list[dict | MCPServer]] = None,
     ) -> None:
         self.id = str(uuid.uuid4())[:8]
         self.name = name
@@ -119,20 +132,17 @@ class Agent:
         # Structured output: convert dict format to Pydantic model internally
         self._output_model = dict_to_model(output_format) if output_format else None
 
-        # Resolve provider: use passed provider, or create one from model/api_key
-        if provider:
+        # Resolve provider only when the user explicitly passes provider or model.
+        if provider is not None:
             self.provider = provider
         elif model:
             self.provider = resolve_provider(model=model, api_key=api_key, max_tokens=max_tokens, temperature=temperature)
         else:
-            self.provider = resolve_provider(api_key=api_key, max_tokens=max_tokens, temperature=temperature)
+            raise ValueError("Agent requires either a model or provider.")
         self.max_iterations = max_iterations
 
-        # Tools: accept Tool objects or @tool-decorated functions
-        self.tools = [
-            t._tool if hasattr(t, "_tool") else t
-            for t in (tools or [])
-        ]
+        # Tools: accept pre-built names, Tool objects, or @tool-decorated functions
+        self.tools = self._normalize_tools(tools or [])
 
         # HITL: auto-register ask_user tool if callback provided
         if on_ask_user:
@@ -151,6 +161,18 @@ class Agent:
 
         # Sessions (optional, persists conversation threads)
         self.session_store = session_store
+
+        # Logging (optional; silent unless developer enables the logger/sinks)
+        self.logger = logger
+
+        # Cost tracking (optional; automatic only when developer passes a tracker)
+        self.cost_tracker = cost_tracker
+
+        # MCP (optional; connected lazily at run time because connection is async)
+        self._mcp_server_configs = mcp_servers or []
+        self.mcp_connector = MCPConnector()
+        self._mcp_connected = False
+        self._setup_mcp_servers(self._mcp_server_configs)
 
         # Context manager
         self.context = ContextManager(
@@ -202,7 +224,7 @@ class Agent:
                     True = stream tokens to console (print).
                     callable = stream tokens to your function.
             output_model: Optional Pydantic model for structured output.
-            attachments: Optional list of file paths, URLs, or Image/PDF objects.
+            attachments: Optional list of file paths, URLs, or Image/PDF/Audio objects.
             user_id: Optional user identifier for session persistence.
             session_id: Optional session identifier for conversation resumption.
         """
@@ -236,14 +258,13 @@ class Agent:
 
         try:
             asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
             raise RuntimeError(
                 "agent.run() was called inside a running event loop. "
                 "Use: result = await agent.arun(...) instead."
             )
-        except RuntimeError as e:
-            if "running event loop" in str(e):
-                raise
-            pass
 
         return asyncio.run(
             self.arun(task, context, stream, output_model, attachments, user_id, session_id)
@@ -282,6 +303,7 @@ class Agent:
     ) -> AgentResult:
         """Run a task and return the full result at once."""
         if not self.provider:
+            self._log_error("No provider configured")
             return AgentResult(
                 agent_name=self.name,
                 success=False,
@@ -290,12 +312,23 @@ class Agent:
             )
 
         self.status = "working"
+        self._log_info("Agent started", {"task": task[:200], "stream": False})
+        await self._ensure_mcp_connected()
 
         # Load relevant past memories if persistent store exists
         memory_context = await self._load_memories(task)
         full_context = f"{memory_context}\n\n{context}".strip() if memory_context else context
 
-        self._setup_conversation(task, full_context, output_model, attachments)
+        audio_error = self._setup_conversation(task, full_context, output_model, attachments)
+        if audio_error:
+            self.status = "failed"
+            self._log_error("Audio input not supported", {"error": audio_error})
+            return AgentResult(
+                agent_name=self.name,
+                success=False,
+                output="",
+                error=audio_error,
+            )
 
         # Session: load previous conversation and prepend
         await self._load_session(user_id, session_id)
@@ -315,6 +348,17 @@ class Agent:
                 tools=tool_defs,
                 thinking=self.thinking.get_config() if self.thinking.enabled else None,
             )
+            self._log_info(
+                "Model response received",
+                {
+                    "model": response.model,
+                    "input_tokens": response.input_tokens,
+                    "output_tokens": response.output_tokens,
+                    "tool_calls": len(response.tool_calls),
+                    "iteration": iteration,
+                },
+            )
+            self._track_cost(response, task)
 
             if response.thinking:
                 self.thinking.process(response.thinking, task_id=task)
@@ -352,6 +396,10 @@ class Agent:
                 validation_retries += 1
                 if validation_retries >= max_validation_retries:
                     self.status = "done"
+                    self._log_error(
+                        "Structured output validation failed",
+                        {"error": error, "attempts": validation_retries},
+                    )
                     return AgentResult(
                         agent_name=self.name,
                         success=False,
@@ -372,6 +420,7 @@ class Agent:
         await self._save_session(user_id, session_id)
         self.status = "done"
         self._messages = self.context.trim_messages(self._messages)
+        self._log_info("Agent completed", {"iterations": iteration})
 
         return AgentResult(
             agent_name=self.name,
@@ -387,6 +436,7 @@ class Agent:
     ) -> AsyncGenerator[StreamEvent, None]:
         """Run a task, yielding StreamEvent objects as tokens arrive."""
         if not self.provider:
+            self._log_error("No provider configured")
             yield StreamEvent(
                 type="done",
                 response=ProviderResponse(content="No provider configured"),
@@ -394,12 +444,22 @@ class Agent:
             return
 
         self.status = "working"
+        self._log_info("Agent started", {"task": task[:200], "stream": True})
+        await self._ensure_mcp_connected()
 
         # Load relevant past memories if persistent store exists
         memory_context = await self._load_memories(task)
         full_context = f"{memory_context}\n\n{context}".strip() if memory_context else context
 
-        self._setup_conversation(task, full_context, output_model, attachments)
+        audio_error = self._setup_conversation(task, full_context, output_model, attachments)
+        if audio_error:
+            self.status = "failed"
+            self._log_error("Audio input not supported", {"error": audio_error})
+            yield StreamEvent(
+                type="done",
+                response=ProviderResponse(content=audio_error),
+            )
+            return
 
         # Session: load previous conversation and prepend
         await self._load_session(user_id, session_id)
@@ -430,6 +490,17 @@ class Agent:
 
             if full_response is None:
                 break
+            self._log_info(
+                "Model response received",
+                {
+                    "model": full_response.model,
+                    "input_tokens": full_response.input_tokens,
+                    "output_tokens": full_response.output_tokens,
+                    "tool_calls": len(full_response.tool_calls),
+                    "iteration": iteration,
+                },
+            )
+            self._track_cost(full_response, task)
 
             if full_response.thinking:
                 self.thinking.process(full_response.thinking, task_id=task)
@@ -486,6 +557,7 @@ class Agent:
         await self._save_session(user_id, session_id)
         self.status = "done"
         self._messages = self.context.trim_messages(self._messages)
+        self._log_info("Agent completed", {"iterations": iteration})
 
         yield StreamEvent(
             type="done",
@@ -499,7 +571,7 @@ class Agent:
     def _setup_conversation(
         self, task: str, context: str, output_model: Optional[Type[BaseModel]] = None,
         attachments: Optional[list] = None,
-    ) -> None:
+    ) -> Optional[str]:
         """Prepare system prompt and initial messages."""
         task_context = task
         if context:
@@ -513,6 +585,9 @@ class Agent:
         # Build user message — text-only or multi-modal
         if attachments:
             content_blocks = process_attachments(attachments)
+            audio_error = self._validate_audio_blocks(content_blocks)
+            if audio_error:
+                return audio_error
             # Prepend the task text
             user_content: list[dict] = [{"type": "text", "text": task}] + content_blocks
             user_message = Message(role="user", content=user_content)
@@ -523,12 +598,45 @@ class Agent:
             Message(role="system", content=system_prompt),
             user_message,
         ]
+        return None
 
     def _get_tool_defs(self) -> Optional[list[dict]]:
         """Get tool definitions in provider format."""
         if not self.tools or not self.provider:
             return None
         return [t.to_provider_format(self.provider.provider_name) for t in self.tools]
+
+    def _validate_audio_blocks(self, blocks: list[dict]) -> Optional[str]:
+        """Return an error if the selected provider/model cannot accept attached audio."""
+        if not self.provider:
+            return None
+
+        supported_formats = self.provider.supported_audio_formats()
+        for block in blocks:
+            if block.get("type") != "audio":
+                continue
+
+            source = block.get("filename") or block.get("url") or "audio attachment"
+            audio_format = block.get("format", "")
+            provider_name = self.provider.provider_name
+            model = self.provider.model
+
+            if not self.provider.supports_audio_input():
+                return (
+                    f"Audio input is not supported by provider '{provider_name}' "
+                    f"for model '{model}'. Provide a transcript or use a model/provider "
+                    "that supports raw audio input."
+                )
+
+            if block.get("source_type") != "base64" or audio_format not in supported_formats:
+                formats = ", ".join(sorted(supported_formats)) or "none"
+                return (
+                    f"Audio input '{source}' with format '{audio_format}' is not "
+                    f"supported by provider '{provider_name}' for model '{model}'. "
+                    f"Supported audio formats: {formats}."
+                )
+
+        return None
 
     async def _load_session(self, user_id: Optional[str], session_id: Optional[str]) -> None:
         """Load previous conversation from session store and prepend to messages."""
@@ -575,20 +683,24 @@ class Agent:
         """Execute a tool by name with given arguments."""
         tool = self._tool_map.get(tool_name)
         if not tool:
+            self._log_error("Tool not found", {"tool": tool_name})
             return ToolResult(
                 success=False,
                 error=f"Unknown tool: {tool_name}",
             )
 
+        self._log_info("Tool started", {"tool": tool_name})
         result = await tool.execute(**arguments)
 
         if result.success:
+            self._log_info("Tool completed", {"tool": tool_name})
             self.memory.add(
                 key=tool_name,
                 value=str(result.output)[:100],
                 category="tool_usage",
             )
         else:
+            self._log_error("Tool failed", {"tool": tool_name, "error": result.error})
             self.memory.add_error(f"Tool {tool_name} failed: {result.error}")
 
         return result
@@ -608,6 +720,28 @@ class Agent:
         self._tool_map = {t.name: t for t in tools}
         self.prompt_manager.update_tools(tools)
 
+    def _normalize_tools(self, tools: list[str | Tool]) -> list[Tool]:
+        normalized: list[Tool] = []
+        seen: set[str] = set()
+
+        for item in tools:
+            if isinstance(item, str):
+                registry = ToolRegistry()
+                registry.register(item)
+                candidates = registry.get_all()
+            else:
+                candidates = [item._tool if hasattr(item, "_tool") else item]
+
+            for tool in candidates:
+                if not isinstance(tool, Tool):
+                    raise TypeError(f"Expected str or Tool, got {type(tool)}")
+                if tool.name in seen:
+                    continue
+                normalized.append(tool)
+                seen.add(tool.name)
+
+        return normalized
+
     def get_conversation_history(self) -> list[Message]:
         """Get the current conversation history."""
         return list(self._messages)
@@ -616,6 +750,56 @@ class Agent:
         """Reset the agent for a new task (keeps memory)."""
         self._messages.clear()
         self.status = "idle"
+
+    def _log_info(self, message: str, data: Optional[dict] = None) -> None:
+        if self.logger:
+            self.logger.info(self.name or "agent", message, data)
+
+    def _log_error(self, message: str, data: Optional[dict] = None) -> None:
+        if self.logger:
+            self.logger.error(self.name or "agent", message, data)
+
+    def _track_cost(self, response: ProviderResponse, task: str) -> None:
+        if not self.cost_tracker:
+            return
+        self.cost_tracker.record(
+            agent_name=self.name or "agent",
+            model=response.model or (self.provider.model if self.provider else ""),
+            input_tokens=response.input_tokens,
+            output_tokens=response.output_tokens,
+            task_id=task[:200],
+        )
+
+    def _setup_mcp_servers(self, server_configs: list[dict | MCPServer]) -> None:
+        for config in server_configs:
+            if isinstance(config, MCPServer):
+                self.mcp_connector.add_server(config)
+            elif isinstance(config, dict):
+                self.mcp_connector.add_server(MCPServer(**config))
+            else:
+                raise TypeError(f"Expected MCPServer or dict, got {type(config)}")
+
+    async def _ensure_mcp_connected(self) -> None:
+        if self._mcp_connected or not self._mcp_server_configs:
+            return
+
+        results = await self.mcp_connector.connect_all()
+        connected = [name for name, ok in results.items() if ok]
+        failed = [name for name, ok in results.items() if not ok]
+
+        if connected:
+            self._log_info("MCP servers connected", {"servers": connected})
+        if failed:
+            self._log_error("MCP servers failed to connect", {"servers": failed})
+
+        mcp_tools = self.mcp_connector.get_all_tools()
+        if mcp_tools:
+            existing = {tool.name for tool in self.tools}
+            tools_to_add = [tool for tool in mcp_tools if tool.name not in existing]
+            if tools_to_add:
+                self.update_tools(self.tools + tools_to_add)
+
+        self._mcp_connected = True
 
 
 class AgentResult:

@@ -37,13 +37,19 @@ class PDF:
 
 
 class Audio:
-    """Audio attachment with optional language hint. (V3 — placeholder)"""
+    """Audio attachment with optional language and format hints."""
 
     def __init__(
         self,
-        source: str,
+        source: Optional[str] = None,
         language: Optional[str] = None,
+        content: Optional[bytes | str] = None,
+        format: Optional[str] = None,
+        media_type: Optional[str] = None,
     ) -> None:
         self.source = source
         self.language = language
+        self.content = content
+        self.format = format
+        self.media_type = media_type
         self.type = "audio"
